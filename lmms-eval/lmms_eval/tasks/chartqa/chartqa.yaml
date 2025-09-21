@@ -1,4 +1,4 @@
-dataset_path: /mnt/afs/intern/huangtao3/mayanxiang/ljc/Speculative_Decoding_For_VLM/MSD/datasets/ChartQA
+dataset_path: /root/Speculative_decoding/datasets/ChartQA
 dataset_kwargs:
   token: True
 task: "chartqa"

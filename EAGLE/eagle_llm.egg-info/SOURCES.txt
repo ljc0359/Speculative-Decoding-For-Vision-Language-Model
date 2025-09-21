@@ -9,6 +9,7 @@ eagle/ge_data/ge_data_all_qwen2vl.py
 eagle/model/__init__.py
 eagle/model/choices.py
 eagle/model/cnets.py
+eagle/model/cnets_talon.py
 eagle/model/configs.py
 eagle/model/ea_llama_model.py
 eagle/model/ea_model.py

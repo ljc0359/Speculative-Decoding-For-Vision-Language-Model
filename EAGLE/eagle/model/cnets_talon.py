@@ -30,22 +30,23 @@ from torch import nn
 from transformers.activations import ACT2FN
 import os, sys
 try:
-    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
+    # 修正路径：从 cnets_talon.py 到项目根目录
+    # /root/.../EAGLE/eagle/model/cnets_talon.py -> /root/.../Speculative-Decoding-For-Vision-Language-Model/
+    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
     if _repo_root not in sys.path:
         sys.path.append(_repo_root)
-    from MSD.TALON.utils import node_scores, mc_node_scores_from_logits, mc_stats_from_logits, dual_uncertainty_alignment
-except Exception:
+    print(f"[CNETS_TALON] Added to sys.path: {_repo_root}")
+    from TALON.utils import node_scores, mc_node_scores_from_logits, mc_stats_from_logits, dual_uncertainty_alignment
+    print(f"[CNETS_TALON] ✅ Successfully imported TALON.utils functions")
+except Exception as e:
+    print(f"[CNETS_TALON] ❌ Failed to import TALON.utils: {e}")
+    print(f"[CNETS_TALON] Current file: {__file__}")
+    print(f"[CNETS_TALON] Calculated repo root: {os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))}")
+    print(f"[CNETS_TALON] sys.path: {sys.path}")
     node_scores = None
-import os, sys
-try:
-    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
-    if _repo_root not in sys.path:
-        sys.path.append(_repo_root)
-    from MSD.TALON.utils import node_scores, mc_node_scores_from_logits, mc_stats_from_logits, dual_uncertainty_alignment
-except Exception:
-    node_scores = None
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-
+    mc_node_scores_from_logits = None
+    mc_stats_from_logits = None
+    dual_uncertainty_alignment = None
 
 from eagle.model.configs import EConfig, Qwen2VLConfig
 from eagle.model.choices import *
@@ -144,15 +145,6 @@ class Model(nn.Module):
         self.explore_penalty = float(explore_penalty)
         self.balance_factor = float(balance_factor)
         self.uncertain_penalty = float(uncertain_penalty)
-        
-        # 添加参数日志
-        # print(f"[TALON] Model initialized with dual uncertainty params:")
-        # print(f"  use_mc_alea_epi: {self.use_mc_alea_epi}")
-        # print(f"  epi_threshold: {self.epi_threshold}, alea_threshold: {self.alea_threshold}")
-        # print(f"  epi_center: {self.epi_center}, alea_center: {self.alea_center}")
-        # print(f"  exploit_bonus: {self.exploit_bonus}, explore_penalty: {self.explore_penalty}")
-        # print(f"  balance_factor: {self.balance_factor}, uncertain_penalty: {self.uncertain_penalty}")
-        # print(f"  score_a: {self.score_a}, score_b: {self.score_b}, score_c: {self.score_c}, score_d: {self.score_d}")
 
         from eagle.model.ea_llama_model import LlamaDecoderLayer
         from eagle.model.ea_qwen2vl_model import Qwen2VLDecoderLayer, Qwen2VLRotaryEmbedding

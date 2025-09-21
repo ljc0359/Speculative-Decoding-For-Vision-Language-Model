@@ -86,9 +86,9 @@ class ChartQA(datasets.GeneratorBasedBuilder):
         # dl_manager is a datasets.download.DownloadManager that can be used to download and extract URLS
         # It can accept any type or nested list/dict and will give back the same structure with the url replaced with path to local files.
         # By default the archives will be extracted and a path to a cached folder where they are extracted is returned instead of the archive
-        image_path = "/mnt/afs/intern/huangtao3/mayanxiang/ljc/Speculative_Decoding_For_VLM/MSD/datasets/ChartQA/test/png"
-        human_annotation_path = "/mnt/afs/intern/huangtao3/mayanxiang/ljc/Speculative_Decoding_For_VLM/MSD/datasets/ChartQA/test/test_human.json"
-        augmented_annotation_path = "/mnt/afs/intern/huangtao3/mayanxiang/ljc/Speculative_Decoding_For_VLM/MSD/datasets/ChartQA/test/test_augmented.json"
+        image_path = "/root/Speculative_decoding/datasets/ChartQA/test/png"
+        human_annotation_path = "/root/Speculative_decoding/datasets/ChartQA/test/test_human.json"
+        augmented_annotation_path = "/root/Speculative_decoding/datasets/ChartQA/test/test_augmented.json"
         return [
             datasets.SplitGenerator(
                 name=datasets.Split.TEST,

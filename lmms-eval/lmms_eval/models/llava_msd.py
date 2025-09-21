@@ -2,8 +2,8 @@ import torch
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
-
 import copy
+import os
 from tqdm import tqdm
 from datetime import timedelta
 
@@ -21,6 +21,15 @@ import warnings
 
 from eagle.model.ea_model import EaModel
 from eagle.model.utils import temp_cache
+
+# 添加calibration logger导入
+try:
+    from eagle.model.calibration_logger import calibration_logger, CALIBRATION_LOGGING_ENABLED
+    print("CALIBRATION_LOGGING_ENABLED True")
+except ImportError as e:
+    print(f"CALIBRATION_LOGGING_ENABLED False: {e}")
+    CALIBRATION_LOGGING_ENABLED = False
+    calibration_logger = None
 
 warnings.filterwarnings("ignore")
 
@@ -448,26 +457,37 @@ class Llava_MSD(lmms):
 
             ea_layer = getattr(self.model, "ea_layer", None)
             if ea_layer is not None:
-                print(f"[LLAVA_MSD] Found ea_layer, setting dual uncertainty params from gen_kwargs")
+                # print(f"[LLAVA_MSD] Found ea_layer, setting dual uncertainty params from gen_kwargs")
+                # print(f"[LLAVA_MSD] Available gen_kwargs keys: {list(gen_kwargs.keys())}")
+                
+                # 打印当前参数状态
+                # print(f"[LLAVA_MSD] Current ea_layer params before update:")
+                # print(f"  use_mc_alea_epi: {getattr(ea_layer, 'use_mc_alea_epi', 'NOT_SET')}")
+                # print(f"  use_uncertainty_scoring: {getattr(ea_layer, 'use_uncertainty_scoring', 'NOT_SET')}")
+                # print(f"  exploit_bonus: {getattr(ea_layer, 'exploit_bonus', 'NOT_SET')}")
+                # print(f"  explore_penalty: {getattr(ea_layer, 'explore_penalty', 'NOT_SET')}")
+                
                 # Namespaced keys first (preferred)
                 use_mc = _pop_bool(gen_kwargs, "talon_use_mc_alea_epi")
                 if use_mc is None:
                     use_mc = _pop_bool(gen_kwargs, "use_mc_alea_epi")
                 if use_mc is not None:
                     ea_layer.use_mc_alea_epi = bool(use_mc)
+                    print(f"[LLAVA_MSD] Set use_mc_alea_epi = {bool(use_mc)}")
 
                 v = _pop_bool(gen_kwargs, "talon_use_uncertainty_scoring")
                 if v is None:
                     v = _pop_bool(gen_kwargs, "use_uncertainty_scoring")
                 if v is not None:
                     ea_layer.use_uncertainty_scoring = bool(v)
+                    print(f"[LLAVA_MSD] Set use_uncertainty_scoring = {bool(v)}")
 
                 v = _pop_bool(gen_kwargs, "talon_use_js")
                 if v is None:
                     v = _pop_bool(gen_kwargs, "use_js")
                 if v is not None:
                     ea_layer.use_js = bool(v)
-
+                
                 v = _pop_int(gen_kwargs, "talon_uncertainty_stride")
                 if v is None:
                     v = _pop_int(gen_kwargs, "uncertainty_stride")
@@ -571,14 +591,6 @@ class Llava_MSD(lmms):
                 if v is not None:
                     ea_layer.uncertain_penalty = float(v)
                 
-                # 打印当前设置的双重不确定性参数
-                print(f"[LLAVA_MSD] Final ea_layer dual uncertainty params:")
-                print(f"  use_mc_alea_epi: {getattr(ea_layer, 'use_mc_alea_epi', 'NOT_SET')}")
-                print(f"  epi_threshold: {getattr(ea_layer, 'epi_threshold', 'NOT_SET')}")
-                print(f"  alea_threshold: {getattr(ea_layer, 'alea_threshold', 'NOT_SET')}")
-                print(f"  exploit_bonus: {getattr(ea_layer, 'exploit_bonus', 'NOT_SET')}")
-                print(f"  explore_penalty: {getattr(ea_layer, 'explore_penalty', 'NOT_SET')}")
-            # inputs.append(question_input)
             input_ids_list = [tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt") for prompt in question_input]
             pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
@@ -680,6 +692,34 @@ class Llava_MSD(lmms):
         res = re_ords.get_original(res)
 
         pbar.close()
+        
+        # 在评估结束时保存calibration数据
+        if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
+            # 保存所有收集的calibration数据
+            calibration_logger.save_data("final_calibration_data")
+            
+            # 计算ECE并绘制图表
+            figure_save_path = "/root/Speculative_decoding/calibration_data/baseline_ece_bin_20.png"
+            os.makedirs(os.path.dirname(figure_save_path), exist_ok=True)
+            
+            stats = calibration_logger.get_calibration_stats(
+                num_bins=20, 
+                save_figure=True, 
+                figure_path=figure_save_path
+            )
+            
+            
+            if stats:
+                eval_logger.info(f"Calibration analysis completed:")
+                eval_logger.info(f"  - ECE: {stats.get('ece', 'N/A'):.4f}")
+                eval_logger.info(f"  - Overall acceptance rate: {stats.get('overall_acceptance_rate', 'N/A'):.4f}")
+                eval_logger.info(f"  - Total samples: {stats.get('total_samples', 'N/A')}")
+                eval_logger.info(f"  - Figure saved to: {figure_save_path}")
+            
+            eval_logger.info("Calibration data saved successfully")
+
+            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(save_path="/root/Speculative_decoding/Cross_Attention")
+
         # Print overall average acceptance length for this evaluation
         if self.use_msd and self.total_accept_steps > 0:
             avg_tau = float(self.total_accept_len) / float(self.total_accept_steps)

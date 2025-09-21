@@ -34,9 +34,14 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from eagle.model.configs import EConfig, Qwen2VLConfig
 from eagle.model.choices import *
 from eagle.model.utils import prepare_logits_processor
-                
 
-
+# 添加calibration logger导入
+try:
+    from eagle.model.calibration_logger import get_calibration_logger
+    CALIBRATION_LOGGING_ENABLED = True
+except ImportError:
+    CALIBRATION_LOGGING_ENABLED = False
+    print("Warning: Calibration logging not available")
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -407,6 +412,33 @@ class Model(nn.Module):
 
         self.reset()
 
+        # 开始新的draft session
+        if CALIBRATION_LOGGING_ENABLED:
+            logger = get_calibration_logger()
+            
+            # 检测图像token位置
+            img_start_idx = None
+            img_end_idx = None
+            
+            # 检测LLaVA的图像token (-200)
+            if -200 in input_ids:
+                img_positions = (input_ids == -200).nonzero(as_tuple=True)[1]
+                if len(img_positions) > 0:
+                    img_start_idx = img_positions[0].item()
+                    img_end_idx = img_positions[-1].item() + 1
+            
+            # 检测Qwen2VL的图像token (151652, 151655等)
+            qwen_image_tokens = [151652, 151655]
+            for token_id in qwen_image_tokens:
+                if token_id in input_ids:
+                    img_positions = (input_ids == token_id).nonzero(as_tuple=True)[1]
+                    if len(img_positions) > 0:
+                        if img_start_idx is None:
+                            img_start_idx = img_positions[0].item()
+                        img_end_idx = max(img_end_idx or 0, img_positions[-1].item() + 1)
+            
+            logger.start_draft_session(img_start_idx=img_start_idx, img_end_idx=img_end_idx)
+
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
             if -200 in input_ids:
@@ -468,24 +500,11 @@ class Model(nn.Module):
 
             out_ids = topk_cs_index // top_k
             input_hidden = out_hidden[:, out_ids]
-            # with Timer("2index"):
-            #     in_ids = topk_cs_index % top_k
-            #     input_ids = topk_index[out_ids, in_ids][None]
-            # with Timer("1index"):
             input_ids = topk_index.view(-1)[topk_cs_index][None]
-            # print(input_ids.equal(input_ids0))
 
             ss_token.append(topk_index)
             scores_list.append(cu_scores)
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
-
-            # if self.threshold < 0 and cu_scores.max() < self.threshold:
-            #     break
-
-        # del parents_list,scores_list,ss_token
-        # return draft_tokens, mask_index,tree_mask,tree_position_ids
-
-        # with Timer("post"):
 
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
@@ -495,6 +514,12 @@ class Model(nn.Module):
 
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+
+        # 记录最终选择的draft tokens的confidence scores
+        if CALIBRATION_LOGGING_ENABLED:
+            logger = get_calibration_logger()
+            final_scores = scores_list[top_scores_index]
+            logger.log_draft_confidence(final_scores, draft_tokens[1:])  # 排除sample_token
 
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)

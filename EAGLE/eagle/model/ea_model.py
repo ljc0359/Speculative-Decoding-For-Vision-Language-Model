@@ -57,39 +57,50 @@ class EaModel(nn.Module):
             bias=True
         # Select draft network implementation
         if use_talon:
+            print("[TALON] use_talon: ",use_talon)
             from .cnets_talon import Model as DraftModel
+
+            self.ea_layer = DraftModel(
+                config,
+                bias=bias,
+                total_tokens=total_token,
+                depth=depth,
+                top_k=top_k,
+                threshold=threshold,
+                use_uncertainty_scoring=kwargs.get('use_uncertainty_scoring', True),
+                uncertainty_stride=kwargs.get('uncertainty_stride', 1),
+                score_a=kwargs.get('score_a', 1.0),
+                score_b=kwargs.get('score_b', 0.1),
+                score_c=kwargs.get('score_c', 0.0),
+                score_d=kwargs.get('score_d', 0.4),
+                use_js=kwargs.get('use_js', False),
+                use_epi=kwargs.get('use_epi', False),
+                reorder_leaves=kwargs.get('reorder_leaves', False),
+                use_mc_alea_epi=kwargs.get('use_mc_alea_epi', True),
+                mc_samples=kwargs.get('mc_samples', 8),
+                mc_noise_std=kwargs.get('mc_noise_std', 0.3),
+                mc_temperature=kwargs.get('mc_temperature', 1.0),
+                mc_kind=kwargs.get('mc_kind', 'gauss'),
+                epi_threshold=kwargs.get('epi_threshold', 5.0),
+                alea_threshold=kwargs.get('alea_threshold', 5.0),
+                epi_center=kwargs.get('epi_center', 0.5),
+                alea_center=kwargs.get('alea_center', 0.5),
+                exploit_bonus=kwargs.get('exploit_bonus', 3.0),
+                explore_penalty=kwargs.get('explore_penalty', -0.3),
+                balance_factor=kwargs.get('balance_factor', 0.5),
+                uncertain_penalty=kwargs.get('uncertain_penalty', -0.8),
+            )
+
         else:
             from .cnets import Model as DraftModel
-        self.ea_layer = DraftModel(
-            config,
-            bias=bias,
-            total_tokens=total_token,
-            depth=depth,
-            top_k=top_k,
-            threshold=threshold,
-            use_uncertainty_scoring=kwargs.get('use_uncertainty_scoring', True),
-            uncertainty_stride=kwargs.get('uncertainty_stride', 1),
-            score_a=kwargs.get('score_a', 1.0),
-            score_b=kwargs.get('score_b', 0.1),
-            score_c=kwargs.get('score_c', 0.0),
-            score_d=kwargs.get('score_d', 0.4),
-            use_js=kwargs.get('use_js', False),
-            use_epi=kwargs.get('use_epi', False),
-            reorder_leaves=kwargs.get('reorder_leaves', False),
-            use_mc_alea_epi=kwargs.get('use_mc_alea_epi', True),
-            mc_samples=kwargs.get('mc_samples', 8),
-            mc_noise_std=kwargs.get('mc_noise_std', 0.3),
-            mc_temperature=kwargs.get('mc_temperature', 1.0),
-            mc_kind=kwargs.get('mc_kind', 'gauss'),
-            epi_threshold=kwargs.get('epi_threshold', 5.0),
-            alea_threshold=kwargs.get('alea_threshold', 5.0),
-            epi_center=kwargs.get('epi_center', 0.5),
-            alea_center=kwargs.get('alea_center', 0.5),
-            exploit_bonus=kwargs.get('exploit_bonus', 3.0),
-            explore_penalty=kwargs.get('explore_penalty', -0.3),
-            balance_factor=kwargs.get('balance_factor', 0.5),
-            uncertain_penalty=kwargs.get('uncertain_penalty', -0.8),
-        )
+            self.ea_layer = DraftModel(
+                config,
+                bias=bias,
+                total_tokens=total_token,
+                depth=depth,
+                top_k=top_k,
+                threshold=threshold
+            )
 
         low_memory=False
 
@@ -219,6 +230,7 @@ class EaModel(nn.Module):
             past_key_values=None,
             output_orig=False,
             position_ids=None,
+            output_attentions=False,  # 新增参数
     ):
 
         with torch.inference_mode():
@@ -229,6 +241,7 @@ class EaModel(nn.Module):
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     position_ids=position_ids,
+                    output_attentions=output_attentions,  # 传递给base model
                 )
             else:
                 outputs = self.base_model.model(
@@ -236,15 +249,25 @@ class EaModel(nn.Module):
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     position_ids=position_ids,
+                    output_attentions=output_attentions,  # 传递给base model
                 )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
             hidden_states = outputs[0]
+            
+            # 提取attention权重（如果需要）
+            attentions = outputs.attentions if output_attentions and hasattr(outputs, 'attentions') else None
 
         if output_orig:
-            return outputs, orig, hidden_states
+            if output_attentions:
+                return outputs, orig, hidden_states, attentions
+            else:
+                return outputs, orig, hidden_states
         else:
-            return outputs, hidden_states
+            if output_attentions:
+                return outputs, hidden_states, attentions
+            else:
+                return outputs, hidden_states
 
     @torch.no_grad()
     def msdgenerate(
@@ -257,6 +280,7 @@ class EaModel(nn.Module):
             max_new_tokens=512,
             max_length=2048,
             log=False,
+            enable_attention_logging=True,  # 新增参数，控制是否启用attention记录
     ):
         
         max_length=max_length-self.ea_layer.total_tokens-10
@@ -268,12 +292,37 @@ class EaModel(nn.Module):
         #assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         # Avoid modifying the input_ids in-place
 
+        # 添加calibration logger导入
+        try:
+            from eagle.model.calibration_logger import get_calibration_logger
+            calibration_logger = get_calibration_logger()
+            CALIBRATION_LOGGING_ENABLED = True
+        except ImportError:
+            CALIBRATION_LOGGING_ENABLED = False
+            calibration_logger = None
+
+        # # 检测图像token位置
+        # img_start_idx, img_end_idx = None, None
+        # if enable_attention_logging and input_ids is not None:
+        #     # 对于LLaVA模型，检测-200 token
+        #     if -200 in input_ids:
+        #         img_indices = torch.where(input_ids == -200)
+        #         if len(img_indices[1]) > 0:
+        #             img_start_idx = img_indices[1][0].item()
+        #             img_end_idx = img_start_idx + 576  # LLaVA图像token数量
+        #     # 对于Qwen2VL模型，检测151652 token
+        #     elif 151652 in input_ids:
+        #         img_indices = torch.where(input_ids == 151652)
+        #         if len(img_indices[1]) > 0:
+        #             img_start_idx = img_indices[1][0].item()
+        #             # 计算图像token数量
+        #             img_token_count = (input_ids == 151655).sum().item()
+        #             img_end_idx = img_start_idx + img_token_count
+
         padding=(torch.zeros(1,1,dtype=torch.long)-1).to(input_ids.device)
         input_ids = input_ids.clone()
         self.ea_layer.reset_kv()
-
-
-
+        
         # Initialize the past key and value states
         if hasattr(self, "past_key_values"):
             past_key_values = self.past_key_values
@@ -304,14 +353,30 @@ class EaModel(nn.Module):
 
             draft_tokens=draft_tokens.to(input_ids.device)
             #with Timer("tree_decoding"):
-            logits, hidden_state_new, outputs = tree_decoding(
-                self,
-                draft_tokens,
-                past_key_values,
-                tree_position_ids,
-                input_ids,
-                retrieve_indices,
-            )
+            
+            # 根据是否启用attention记录来调用tree_decoding
+            if enable_attention_logging and CALIBRATION_LOGGING_ENABLED:
+                logits, hidden_state_new, outputs, attentions = tree_decoding(
+                    self,
+                    draft_tokens,
+                    past_key_values,
+                    tree_position_ids,
+                    input_ids,
+                    retrieve_indices,
+                    output_attentions=True,
+                )
+            else:
+                logits, hidden_state_new, outputs = tree_decoding(
+                    self,
+                    draft_tokens,
+                    past_key_values,
+                    tree_position_ids,
+                    input_ids,
+                    retrieve_indices,
+                    output_attentions=False,
+                )
+                attentions = None
+            
             #retrieve_indices=tree_buffers["retrieve_indices"]
             #logits = logits[0, retrieve_indices]
             draft_tokens=torch.cat((draft_tokens,padding),dim=1)
@@ -319,9 +384,27 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            
+            # 记录calibration数据
+            if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
+                # 记录attention权重（如果可用）
+                if attentions is not None and enable_attention_logging:
+                    # 取最后一层的attention权重
+                    last_layer_attention = attentions[-1] if isinstance(attentions, (list, tuple)) else attentions
+                    calibration_logger.log_attention_weights(last_layer_attention)
+                
+                # 注意：不要修改原有的log_acceptance调用，那是用于计算平均接受率的
+                calibration_logger.log_acceptance(
+                    draft_tokens=candidates, 
+                    accepted_length=accept_length,
+                    best_candidate=best_candidate
+                )
+            
             self.acclen += accept_length
             self.accnum += 1
             # print(accept_length)
+            
+            # 继续原有的生成逻辑...
             #with Timer("update_inference_inputs"):
             input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
@@ -346,6 +429,7 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        
         if not log:
             return input_ids
         else:

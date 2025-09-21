@@ -333,6 +333,7 @@ def tree_decoding(
         tree_position_ids,
         input_ids,
         retrieve_indices,
+        output_attentions=False,  # 新增参数
 ):
     position_ids = tree_position_ids + input_ids.shape[1]
 
@@ -346,17 +347,32 @@ def tree_decoding(
     # tree_candidates = tree_candidates[:, :2]
     # position_ids = position_ids[:2]
     # model.base_model.model.tree_mask = None
-    outputs, tree_logits, hidden_state = model(
-        tree_candidates,
-        output_orig=True,
-        past_key_values=past_key_values,
-        position_ids=position_ids,
-    )
-
-
+    
+    # 调用model时传递output_attentions参数
+    if output_attentions:
+        outputs, tree_logits, hidden_state, attentions = model(
+            tree_candidates,
+            output_orig=True,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            output_attentions=True,
+        )
+    else:
+        outputs, tree_logits, hidden_state = model(
+            tree_candidates,
+            output_orig=True,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            output_attentions=False,
+        )
+        attentions = None
 
     logits = tree_logits[0, retrieve_indices]
-    return logits, hidden_state, outputs
+    
+    if output_attentions:
+        return logits, hidden_state, outputs, attentions
+    else:
+        return logits, hidden_state, outputs
 
 
 
