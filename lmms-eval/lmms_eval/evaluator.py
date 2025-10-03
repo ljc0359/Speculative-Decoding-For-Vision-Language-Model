@@ -655,6 +655,7 @@ def evaluate(
                     "accept_steps": total_steps,
                     "accept_len": total_len,
                 }
+        
         if log_samples:
             results_dict["samples"] = dict(samples)
     else:

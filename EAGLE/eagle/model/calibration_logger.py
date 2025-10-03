@@ -53,67 +53,36 @@ class CalibrationLogger:
             'cross_modal_attention': []  # 存储每个token的跨模态注意力强度
         }
     
-    def log_draft_confidence(self, confidence_scores: torch.Tensor, draft_tokens: torch.Tensor):
+    def log_draft_confidence(self, path_confidence_scores: torch.Tensor, local_confidence_scores: torch.Tensor, 
+                           draft_tokens: torch.Tensor, tree_positions: torch.Tensor, tree_depths: torch.Tensor, 
+                           parent_positions: torch.Tensor):
         """
-        记录draft model的confidence scores
+        记录draft model的多种confidence信息和树位置信息
         
         Args:
-            confidence_scores: draft model对每个token的confidence score (log probabilities)
+            path_confidence_scores: 路径累计confidence scores (log probabilities)
+            local_confidence_scores: 单步token confidence scores (log probabilities) 
             draft_tokens: 对应的draft tokens
+            tree_positions: token在树中的BFS位置编号 (P1, P2, ...)
+            tree_depths: token在树中的深度 (1, 2, 3, ...)
+            parent_positions: 父节点的位置编号 (0表示根节点的子节点)
         """
         if hasattr(self, 'current_session') and self.current_session is not None:
             # 转换为概率值 (从log probability)
-            probs = torch.exp(confidence_scores).cpu().numpy()
-            tokens = draft_tokens.cpu().numpy()
+            path_probs = torch.exp(path_confidence_scores).cpu().numpy()
+            local_probs = torch.exp(local_confidence_scores).cpu().numpy()
             
-            self.current_session['confidence_scores'] = probs.flatten()
-            # 使用统一的字段名 'tokens'，同时保留 'draft_tokens' 以保持兼容性
-            self.current_session['tokens'] = tokens.flatten()
-            self.current_session['draft_tokens'] = tokens.flatten()  # 保持兼容性
-    
-    def calculate_cross_modal_attention(self, attention_weights: torch.Tensor, 
-                                      img_start_idx: int, img_end_idx: int) -> List[float]:
-        """
-        计算每个token对图像token的跨模态注意力强度
-        
-        Args:
-            attention_weights: 注意力权重张量 [batch_size, num_heads, seq_len, seq_len]
-            img_start_idx: 图像token起始索引
-            img_end_idx: 图像token结束索引
+            # 记录多种置信度信息
+            self.current_session['path_confidence_scores'] = path_probs.flatten()  # 路径累计置信度
+            self.current_session['local_confidence_scores'] = local_probs.flatten()  # 单步置信度
             
-        Returns:
-            每个token的跨模态注意力强度列表
-        """
-        if attention_weights is None or img_start_idx is None or img_end_idx is None:
-            return []
-        
-        # 确保attention_weights是tensor
-        if not isinstance(attention_weights, torch.Tensor):
-            return []
-        
-        # 获取最后一层的attention权重
-        if len(attention_weights.shape) == 4:  # [batch, heads, seq_len, seq_len]
-            attn = attention_weights[0]  # 取第一个batch
-        else:
-            attn = attention_weights
-        
-        # 对所有head求平均
-        if len(attn.shape) == 3:  # [heads, seq_len, seq_len]
-            attn = attn.mean(dim=0)  # [seq_len, seq_len]
-        
-        cross_modal_scores = []
-        seq_len = attn.shape[0]
-        
-        # 计算每个token对图像区域的注意力强度
-        for token_idx in range(seq_len):
-            if img_start_idx < seq_len and img_end_idx <= seq_len:
-                # 对图像token区域的注意力权重求和/均值
-                img_attention = attn[token_idx, img_start_idx:img_end_idx].sum().item()
-                cross_modal_scores.append(img_attention)
-            else:
-                cross_modal_scores.append(0.0)
-        
-        return cross_modal_scores
+            # 记录树位置信息
+            self.current_session['tree_positions'] = tree_positions.cpu().numpy().flatten()  # BFS位置编号
+            self.current_session['tree_depths'] = tree_depths.cpu().numpy().flatten()  # 树深度
+            self.current_session['parent_positions'] = parent_positions.cpu().numpy().flatten()  # 父节点位置
+            
+            # 记录token信息（用于调试和验证）
+            self.current_session['draft_tokens'] = draft_tokens.cpu().numpy().flatten()
     
     def log_attention_weights(self, attention_weights: torch.Tensor):
         """
@@ -136,6 +105,102 @@ class CalibrationLogger:
                 self.current_session['img_end_idx']
             )
             self.current_session['cross_modal_attention'] = cross_modal_scores
+
+    def calculate_cross_modal_attention(self, attention_weights: torch.Tensor, 
+                                      img_start_idx: int, img_end_idx: int) -> List[float]:
+        """
+        计算推测解码中候选token对图像token的跨模态注意力强度
+        
+        在推测解码中，attention_weights的结构是：
+        - 形状: [batch_size, num_heads, candidate_seq_len, full_context_len]
+        - candidate_seq_len: 候选token数量（约60个）
+        - full_context_len: 完整上下文长度（包含原始输入和图像token）
+        
+        Args:
+            attention_weights: 注意力权重张量，候选token对完整上下文的attention
+            img_start_idx: 图像token在完整上下文中的起始索引
+            img_end_idx: 图像token在完整上下文中的结束索引
+            
+        Returns:
+            每个候选token的跨模态注意力强度列表
+        """
+        
+        if attention_weights is None or img_start_idx is None or img_end_idx is None:
+            return []
+        
+        # 确保attention_weights是tensor
+        if not isinstance(attention_weights, torch.Tensor):
+            return []
+        
+        if torch.isnan(attention_weights).any():
+            return []
+        if torch.isinf(attention_weights).any():
+            return []
+        
+        try:
+            if len(attention_weights.shape) == 4:
+                batch_size, num_heads, candidate_seq_len, full_context_len = attention_weights.shape
+                attn = attention_weights[0]
+            elif len(attention_weights.shape) == 3:
+                num_heads, candidate_seq_len, full_context_len = attention_weights.shape
+                attn = attention_weights
+            elif len(attention_weights.shape) == 2:
+                candidate_seq_len, full_context_len = attention_weights.shape
+                attn = attention_weights   
+            else:
+                return []
+            
+            # 对多个head求平均（如果需要）
+            if len(attn.shape) == 3:  # [num_heads, candidate_seq_len, full_context_len]
+                attn = attn.mean(dim=0)  # [candidate_seq_len, full_context_len]
+                # print(f"DEBUG: After head averaging, shape: {attn.shape}")
+            
+            candidate_seq_len, full_context_len = attn.shape
+            
+            # 验证图像token索引的有效性
+            if img_start_idx < 0 or img_end_idx <= img_start_idx:
+                # print(f"DEBUG: Invalid image token indices: start={img_start_idx}, end={img_end_idx}")
+                return [0.0] * candidate_seq_len
+            
+            if img_end_idx > full_context_len:
+                # print(f"DEBUG: Image token end index {img_end_idx} exceeds context length {full_context_len}")
+                # 调整到有效范围
+                img_end_idx = min(img_end_idx, full_context_len)
+                if img_start_idx >= img_end_idx:
+                    # print("DEBUG: No valid image tokens after adjustment")
+                    return [0.0] * candidate_seq_len
+            
+            # print(f"DEBUG: Using image token range: [{img_start_idx}:{img_end_idx}] in context of length {full_context_len}")
+            
+            # 计算每个候选token对图像区域的注意力强度
+            cross_modal_scores = []
+            
+            # 提取候选token对图像token的attention
+            img_attention_matrix = attn[:, img_start_idx:img_end_idx]  # [candidate_seq_len, img_token_len]
+            # print(f"DEBUG: Image attention matrix shape: {img_attention_matrix.shape}")
+            
+            # 对每个候选token计算其对图像区域的总attention
+            for token_idx in range(candidate_seq_len):
+                # 对该token对所有图像token的attention求和
+                img_attention_sum = img_attention_matrix[token_idx].sum().item()
+                cross_modal_scores.append(img_attention_sum)
+                
+                # 打印前几个token的详细信息
+                if token_idx < 5:
+                    img_attention_mean = img_attention_matrix[token_idx].mean().item()
+                    img_attention_max = img_attention_matrix[token_idx].max().item()
+                    print(f"DEBUG: candidate_token_{token_idx} -> img_attention: sum={img_attention_sum:.6f}, mean={img_attention_mean:.6f}, max={img_attention_max:.6f}")
+            
+            # 统计信息
+            if cross_modal_scores:
+                scores_tensor = torch.tensor(cross_modal_scores)
+            
+            return cross_modal_scores
+        
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return []
     
     def log_acceptance(self, accepted_length: int, draft_tokens=None, best_candidate=None):
         """记录acceptance结果"""
@@ -152,7 +217,59 @@ class CalibrationLogger:
         
         # 记录额外的acceptance信息（如果提供）
         if draft_tokens is not None:
-            self.current_session['draft_tokens'] = draft_tokens.cpu().tolist() if hasattr(draft_tokens, 'cpu') else draft_tokens
+            # 统一成扁平list
+            if hasattr(draft_tokens, 'cpu'):
+                tokens = draft_tokens.cpu().numpy().flatten().tolist()
+            else:
+                # list/np.ndarray等
+                tokens = draft_tokens.flatten().tolist() if hasattr(draft_tokens, 'flatten') else list(draft_tokens)
+            self.current_session['tokens'] = tokens
+            self.current_session['draft_tokens'] = tokens  # 保持兼容性
+            
+            # 与confidence_scores长度对齐（支持新的多种置信度字段）
+            path_probs = self.current_session.get('path_confidence_scores', None)
+            local_probs = self.current_session.get('local_confidence_scores', None)
+            # 向后兼容旧字段
+            legacy_probs = self.current_session.get('confidence_scores', None)
+            
+            # 优先使用新字段，如果没有则使用旧字段
+            probs = path_probs if path_probs is not None else legacy_probs
+            
+            if probs is not None:
+                # 转为list以便处理
+                probs_list = probs.tolist() if not isinstance(probs, list) else probs
+                min_len = min(len(tokens), len(probs_list))
+                if len(tokens) != len(probs_list):
+                    # 截断到一致长度
+                    tokens = tokens[:min_len]
+                    probs_list = probs_list[:min_len]
+                    self.current_session['tokens'] = tokens
+                    self.current_session['draft_tokens'] = tokens
+                    
+                    # 同时截断所有置信度相关字段
+                    if path_probs is not None:
+                        self.current_session['path_confidence_scores'] = probs_list
+                    if local_probs is not None:
+                        local_probs_list = local_probs.tolist() if not isinstance(local_probs, list) else local_probs
+                        self.current_session['local_confidence_scores'] = local_probs_list[:min_len]
+                    if legacy_probs is not None:
+                        self.current_session['confidence_scores'] = probs_list
+                    
+                    # 同时截断树位置信息
+                    for field in ['tree_positions', 'tree_depths', 'parent_positions']:
+                        if field in self.current_session and self.current_session[field] is not None:
+                            field_data = self.current_session[field]
+                            if isinstance(field_data, (list, np.ndarray)) and len(field_data) > min_len:
+                                self.current_session[field] = field_data[:min_len]
+                
+                # 生成 per-token acceptance labels：前 accepted_length 个为1，其余为0
+                acceptance_labels = [1 if i < accepted_length else 0 for i in range(min_len)]
+                self.current_session['acceptance_labels'] = acceptance_labels
+            else:
+                # 没有confidence_scores也生成labels，但后续分析会发现缺少配对
+                acceptance_labels = [1 if i < accepted_length else 0 for i in range(len(tokens))]
+                self.current_session['acceptance_labels'] = acceptance_labels
+        
         if best_candidate is not None:
             self.current_session['best_candidate'] = best_candidate.cpu().tolist() if hasattr(best_candidate, 'cpu') else best_candidate
         
@@ -167,16 +284,23 @@ class CalibrationLogger:
         提取token级别的数据用于分析
         
         Returns:
-            List[Dict]: 每个token的数据，包含confidence, is_accepted, token, cross_modal_attention
+            List[Dict]: 每个token的数据，包含path_confidence, local_confidence, is_accepted, token, cross_modal_attention, tree_position, tree_depth, parent_position
         """
         token_data = []
         
         for session in self.draft_sessions:
-            confidence_scores = session.get('confidence_scores', [])
+            # 支持新的多种置信度字段，同时保持向后兼容
+            path_confidence_scores = session.get('path_confidence_scores', session.get('confidence_scores', []))
+            local_confidence_scores = session.get('local_confidence_scores', session.get('confidence_scores', []))
             # 修复：使用正确的字段名，支持两种字段名以保持兼容性
             tokens = session.get('draft_tokens', session.get('tokens', []))
             accepted_length = session.get('accepted_length', 0)
             cross_modal_attention = session.get('cross_modal_attention', [])
+            
+            # 新增的树位置信息
+            tree_positions = session.get('tree_positions', [])
+            tree_depths = session.get('tree_depths', [])
+            parent_positions = session.get('parent_positions', [])
             
             # 确保数据类型正确
             if isinstance(accepted_length, torch.Tensor):
@@ -185,8 +309,10 @@ class CalibrationLogger:
                 accepted_length = int(accepted_length) if accepted_length is not None else 0
             
             # 确保confidence_scores和tokens都是列表或数组
-            if isinstance(confidence_scores, torch.Tensor):
-                confidence_scores = confidence_scores.cpu().numpy()
+            if isinstance(path_confidence_scores, torch.Tensor):
+                path_confidence_scores = path_confidence_scores.cpu().numpy()
+            if isinstance(local_confidence_scores, torch.Tensor):
+                local_confidence_scores = local_confidence_scores.cpu().numpy()
             if isinstance(tokens, torch.Tensor):
                 tokens = tokens.cpu().numpy()
             
@@ -202,35 +328,67 @@ class CalibrationLogger:
             else:
                 tokens = np.array([])
             
-            # 处理confidence_scores可能是嵌套的情况
-            if isinstance(confidence_scores, (list, np.ndarray)) and len(confidence_scores) > 0:
-                if isinstance(confidence_scores[0], (list, np.ndarray)):
+            # 处理path_confidence_scores可能是嵌套的情况
+            if isinstance(path_confidence_scores, (list, np.ndarray)) and len(path_confidence_scores) > 0:
+                if isinstance(path_confidence_scores[0], (list, np.ndarray)):
                     # 如果是嵌套列表，展平它
-                    confidence_scores = np.concatenate([np.array(c).flatten() for c in confidence_scores])
+                    path_confidence_scores = np.concatenate([np.array(c).flatten() for c in path_confidence_scores])
                 else:
                     # 确保是一维数组
-                    confidence_scores = np.array(confidence_scores).flatten()
+                    path_confidence_scores = np.array(path_confidence_scores).flatten()
             else:
-                confidence_scores = np.array([])
+                path_confidence_scores = np.array([])
+            
+            # 处理local_confidence_scores可能是嵌套的情况
+            if isinstance(local_confidence_scores, (list, np.ndarray)) and len(local_confidence_scores) > 0:
+                if isinstance(local_confidence_scores[0], (list, np.ndarray)):
+                    # 如果是嵌套列表，展平它
+                    local_confidence_scores = np.concatenate([np.array(c).flatten() for c in local_confidence_scores])
+                else:
+                    # 确保是一维数组
+                    local_confidence_scores = np.array(local_confidence_scores).flatten()
+            else:
+                local_confidence_scores = np.array([])
             
             # 确保长度一致
-            if len(confidence_scores) > 0 and len(tokens) > 0:
-                min_length = min(len(confidence_scores), len(tokens))
-                confidence_scores = confidence_scores[:min_length]
+            if len(path_confidence_scores) > 0 and len(tokens) > 0:
+                min_length = min(len(path_confidence_scores), len(local_confidence_scores), len(tokens))
+                path_confidence_scores = path_confidence_scores[:min_length]
+                local_confidence_scores = local_confidence_scores[:min_length]
                 tokens = tokens[:min_length]
                 
-                for i, (conf, token) in enumerate(zip(confidence_scores, tokens)):
+                # 截断其他数组到相同长度
+                cross_modal_attention = cross_modal_attention[:min_length] if len(cross_modal_attention) > min_length else cross_modal_attention
+                tree_positions = tree_positions[:min_length] if len(tree_positions) > min_length else tree_positions
+                tree_depths = tree_depths[:min_length] if len(tree_depths) > min_length else tree_depths
+                parent_positions = parent_positions[:min_length] if len(parent_positions) > min_length else parent_positions
+                
+                for i in range(min_length):
+                    path_conf = path_confidence_scores[i] if i < len(path_confidence_scores) else 0.0
+                    local_conf = local_confidence_scores[i] if i < len(local_confidence_scores) else 0.0
+                    token = tokens[i] if i < len(tokens) else 0
                     is_accepted = bool(i < accepted_length)
                     cross_modal_score = cross_modal_attention[i] if i < len(cross_modal_attention) else 0.0
+                    tree_position = tree_positions[i] if i < len(tree_positions) else 0
+                    tree_depth = tree_depths[i] if i < len(tree_depths) else 0
+                    parent_position = parent_positions[i] if i < len(parent_positions) else 0
                     
                     # 确保所有数据都是Python原生类型
                     try:
-                        if isinstance(conf, (torch.Tensor, np.ndarray)):
-                            conf = float(conf.item() if hasattr(conf, 'item') else conf)
+                        if isinstance(path_conf, (torch.Tensor, np.ndarray)):
+                            path_conf = float(path_conf.item() if hasattr(path_conf, 'item') else path_conf)
                         else:
-                            conf = float(conf)
+                            path_conf = float(path_conf)
                     except (ValueError, TypeError):
-                        conf = 0.0
+                        path_conf = 0.0
+                    
+                    try:
+                        if isinstance(local_conf, (torch.Tensor, np.ndarray)):
+                            local_conf = float(local_conf.item() if hasattr(local_conf, 'item') else local_conf)
+                        else:
+                            local_conf = float(local_conf)
+                    except (ValueError, TypeError):
+                        local_conf = 0.0
                     
                     try:
                         if isinstance(token, (torch.Tensor, np.ndarray)):
@@ -251,21 +409,42 @@ class CalibrationLogger:
                     except (ValueError, TypeError):
                         cross_modal_score = 0.0
                     
+                    try:
+                        tree_position = int(tree_position)
+                    except (ValueError, TypeError):
+                        tree_position = 0
+                    
+                    try:
+                        tree_depth = int(tree_depth)
+                    except (ValueError, TypeError):
+                        tree_depth = 0
+                    
+                    try:
+                        parent_position = int(parent_position)
+                    except (ValueError, TypeError):
+                        parent_position = 0
+                    
                     token_data.append({
-                        'confidence': conf,
+                        'path_confidence': path_conf,
+                        'local_confidence': local_conf,
+                        'confidence': path_conf,  # 保持向后兼容
                         'is_accepted': is_accepted,
                         'token': token,
-                        'cross_modal_attention': cross_modal_score
+                        'cross_modal_attention': cross_modal_score,
+                        'tree_position': tree_position,
+                        'tree_depth': tree_depth,
+                        'parent_position': parent_position
                     })
         
         return token_data
     
-    def analyze_by_cross_modal_attention(self, num_quantiles: int = 5) -> Dict[str, Any]:
+    def analyze_by_cross_modal_attention(self, num_quantiles: int = 5, use_equal_frequency_confidence_bins: bool = False) -> Dict[str, Any]:
         """
         按跨模态注意力强度分位数分析校准情况
         
         Args:
             num_quantiles: 分位数数量
+            use_equal_frequency_confidence_bins: 是否对置信度使用等频分箱
             
         Returns:
             分析结果字典
@@ -274,258 +453,313 @@ class CalibrationLogger:
         if not token_data:
             return {}
         
-        # 提取跨模态注意力分数
         cross_modal_scores = [item['cross_modal_attention'] for item in token_data]
-        confidences = [item['confidence'] for item in token_data]
+        # 优先使用path_confidence，如果没有则使用旧的confidence字段
+        confidences = [item.get('path_confidence', item.get('confidence', 0.0)) for item in token_data]
         acceptances = [item['is_accepted'] for item in token_data]
         
-        # 计算分位数阈值
-        quantiles = np.linspace(0, 1, num_quantiles + 1)
-        thresholds = np.quantile(cross_modal_scores, quantiles)
+        # 改为基于排序索引的等频分箱，避免阈值重复导致的空箱
+        scores = np.array(cross_modal_scores, dtype=float)
+        N = len(scores)
+        if N == 0:
+            return {}
+        
+        # 如果样本数少于分位数数量，缩小分位数数量
+        actual_quantiles = min(num_quantiles, N)
+        order = np.argsort(scores)
+        bin_idx = np.linspace(0, N, actual_quantiles + 1).astype(int)
+        quantile_labels = np.zeros(N, dtype=int)
+        for i in range(actual_quantiles):
+            start, end = bin_idx[i], bin_idx[i + 1]
+            quantile_labels[order[start:end]] = i
         
         results = {}
-        for i in range(num_quantiles):
-            # 找到属于当前分位数的token
-            if i == num_quantiles - 1:  # 最后一个分位数包含最大值
-                mask = (np.array(cross_modal_scores) >= thresholds[i]) & (np.array(cross_modal_scores) <= thresholds[i+1])
-            else:
-                mask = (np.array(cross_modal_scores) >= thresholds[i]) & (np.array(cross_modal_scores) < thresholds[i+1])
-            
+        for i in range(actual_quantiles):
+            mask = (quantile_labels == i)
             if np.sum(mask) == 0:
                 continue
             
             quantile_confidences = np.array(confidences)[mask]
             quantile_acceptances = np.array(acceptances)[mask]
+            quantile_scores = scores[mask]
             
-            # 计算该分位数的校准指标
-            ece = self.calculate_ece(quantile_confidences, quantile_acceptances)
-            avg_confidence = np.mean(quantile_confidences)
-            avg_accuracy = np.mean(quantile_acceptances)
+            # 计算ECE（置信度分箱仍按配置使用等频或等宽）
+            ece = self.calculate_ece(quantile_confidences, quantile_acceptances, 
+                                     use_equal_frequency=use_equal_frequency_confidence_bins)
+            avg_confidence = float(np.mean(quantile_confidences))
+            avg_accuracy = float(np.mean(quantile_acceptances))
+            
+            # 用该分位数内的最小/最大注意力作为范围展示
+            range_str = f'[{float(np.min(quantile_scores)):.4f}, {float(np.max(quantile_scores)):.4f}]'
             
             results[f'Q{i+1}'] = {
-                'range': f'[{thresholds[i]:.4f}, {thresholds[i+1]:.4f}]',
+                'range': range_str,
                 'count': int(np.sum(mask)),
-                'avg_cross_modal_attention': np.mean(np.array(cross_modal_scores)[mask]),
+                'avg_cross_modal_attention': float(np.mean(quantile_scores)),
                 'avg_confidence': avg_confidence,
                 'avg_accuracy': avg_accuracy,
                 'ece': ece,
                 'confidence_scores': quantile_confidences.tolist(),
-                'acceptance_labels': quantile_acceptances.tolist()
+                'acceptance_labels': quantile_acceptances.tolist(),
+                'binning_method': 'equal_frequency' if use_equal_frequency_confidence_bins else 'equal_width'
             }
         
         return results
     
-    def plot_cross_modal_attention_comprehensive_analysis(self, save_path: Optional[str] = None, num_quantiles: int = 5, num_bins: int = 20) -> List[str]:
+    def plot_cross_modal_attention_comprehensive_analysis(
+        self,
+        save_path: Optional[str] = None, 
+        num_quantiles: int = 5,
+        num_bins: int = 20,
+        confidence_binning: str = "equal_frequency"  # "equal_frequency" | "equal_width" | "both"
+    ) -> List[str]:
         """
         绘制跨模态注意力的综合分析图，包含三个独立的图：
-        1. 按注意力分位数的接受率分析
-        2. 每个注意力分位数的条件可靠性图
-        3. 置信度×注意力分位数的二维热力图
-        
+        1. 按注意力分位数的接受率分析（与置信度分箱无关，仅按注意力分位数）
+        2. 每个注意力分位数的条件可靠性图（可选：等频/等距分箱）
+        3. 置信度×注意力分位数的二维热力图（可选：等频/等距分箱）
+
         Args:
-            save_path: 保存路径前缀（不包含文件名）
+            save_path: 保存目录（不包含文件名）
             num_quantiles: 注意力分位数数量 (默认5，对应Q1-Q5)
             num_bins: 置信度分桶数量 (默认20)
-            
+            confidence_binning: 置信度分箱策略:
+                - "equal_frequency": 等频分箱（默认）
+                - "equal_width": 等距分箱
+                - "both": 两种都画（文件名会带后缀）
+
         Returns:
-            保存的三个图片路径列表
+            保存的图片路径列表
         """
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        # ---------- 数据准备 ----------
         token_data = self.get_token_level_data()
         if not token_data:
             print("No data available for cross-modal attention analysis")
             return []
-        
-        # 提取数据
-        cross_modal_scores = np.array([item['cross_modal_attention'] for item in token_data])
-        confidences = np.array([item['confidence'] for item in token_data])
-        acceptances = np.array([item['is_accepted'] for item in token_data])
-        
-        # 计算等频分位数阈值
-        quantiles = np.linspace(0, 1, num_quantiles + 1)
-        thresholds = np.quantile(cross_modal_scores, quantiles)
-        
-        # 为每个token分配分位数标签
-        quantile_labels = np.zeros(len(cross_modal_scores), dtype=int)
-        for i in range(num_quantiles):
-            if i == num_quantiles - 1:  # 最后一个分位数包含最大值
-                mask = (cross_modal_scores >= thresholds[i]) & (cross_modal_scores <= thresholds[i+1])
-            else:
-                mask = (cross_modal_scores >= thresholds[i]) & (cross_modal_scores < thresholds[i+1])
-            quantile_labels[mask] = i
-        
-        # 准备保存路径
-        if save_path is None:
-            save_dir = self.save_dir
-        else:
-            save_dir = save_path
-        
-        # 确保保存目录存在
+
+        cross_modal_scores = np.array([item['cross_modal_attention'] for item in token_data], dtype=float)
+        confidences = np.array([item.get('path_confidence', item.get('confidence', 0.0)) for item in token_data], dtype=float)
+        acceptances = np.array([item['is_accepted'] for item in token_data], dtype=float)
+
+        N = len(cross_modal_scores)
+        if N == 0:
+            print("No data available for cross-modal attention analysis")
+            return []
+
+        # ---------- 注意力分位数（等频，不会空箱） ----------
+        actual_quantiles = min(num_quantiles, N)
+        order = np.argsort(cross_modal_scores)
+        bin_idx = np.linspace(0, N, actual_quantiles + 1).astype(int)
+        quantile_labels = np.zeros(N, dtype=int)
+        for i in range(actual_quantiles):
+            start, end = bin_idx[i], bin_idx[i + 1]
+            quantile_labels[order[start:end]] = i
+
+        # ---------- 保存目录 ----------
+        save_dir = self.save_dir if save_path is None else save_path
         os.makedirs(save_dir, exist_ok=True)
-        
         saved_paths = []
-        
-        # ========== 图1: 按注意力分位数的接受率分析 ==========
+
+        # ---------- 图1：按注意力分位数的接受率（与置信度分箱策略无关） ----------
         plt.figure(figsize=(12, 8))
-        quantile_names = [f'Q{i+1}' for i in range(num_quantiles)]
+        quantile_names = [f'Q{i+1}' for i in range(actual_quantiles)]
         acceptance_rates = []
         quantile_counts = []
-        
-        for i in range(num_quantiles):
-            mask = quantile_labels == i
+
+        for i in range(actual_quantiles):
+            mask = (quantile_labels == i)
             if np.sum(mask) > 0:
-                acceptance_rate = np.mean(acceptances[mask])
-                acceptance_rates.append(acceptance_rate)
-                quantile_counts.append(np.sum(mask))
+                acceptance_rates.append(float(np.mean(acceptances[mask])))
+                quantile_counts.append(int(np.sum(mask)))
             else:
-                acceptance_rates.append(0)
+                acceptance_rates.append(0.0)
                 quantile_counts.append(0)
-        
-        bars = plt.bar(quantile_names, acceptance_rates, color='skyblue', alpha=0.7, edgecolor='navy')
+
+        bars = plt.bar(quantile_names, acceptance_rates, alpha=0.7, edgecolor='black')
         plt.xlabel('Attention Quantiles (Q1=Weak Visual Dependency, Q5=Strong Visual Dependency)', fontsize=14)
         plt.ylabel('Acceptance Rate', fontsize=14)
         plt.title('Acceptance Rate Analysis by Cross-Modal Attention Quantiles', fontsize=16, fontweight='bold')
         plt.ylim(0, 1)
-        
-        # 在柱状图上添加数值标签
+
         for bar, rate, count in zip(bars, acceptance_rates, quantile_counts):
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                    f'{rate:.3f}\n(n={count})', ha='center', va='bottom', fontsize=12)
-        
-        # 添加网格
+            h = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., h + 0.01, f'{rate:.3f}\n(n={count})',
+                    ha='center', va='bottom', fontsize=12)
+
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        
-        # 保存第一个图
         save_path_1 = os.path.join(save_dir, "cross_modal_attention_acceptance_rates.png")
         plt.savefig(save_path_1, dpi=300, bbox_inches='tight')
         plt.close()
         saved_paths.append(save_path_1)
-        
-        # ========== 图2: 每个注意力分位数的条件可靠性图 ==========
-        plt.figure(figsize=(12, 8))
-        colors = plt.cm.viridis(np.linspace(0, 1, num_quantiles))
-        
-        for i in range(num_quantiles):
-            mask = quantile_labels == i
-            if np.sum(mask) < 10:  # 跳过样本太少的分位数
-                continue
-                
-            q_confidences = confidences[mask]
-            q_acceptances = acceptances[mask]
-            
-            # 创建置信度分桶
-            bin_edges = np.linspace(0, 1, num_bins + 1)
-            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-            bin_acceptance_rates = []
-            bin_counts = []
-            
-            for j in range(num_bins):
-                bin_mask = (q_confidences >= bin_edges[j]) & (q_confidences < bin_edges[j+1])
-                if j == num_bins - 1:  # 最后一个bin包含1.0
-                    bin_mask = (q_confidences >= bin_edges[j]) & (q_confidences <= bin_edges[j+1])
-                
-                if np.sum(bin_mask) > 0:
-                    bin_acceptance_rate = np.mean(q_acceptances[bin_mask])
-                    bin_acceptance_rates.append(bin_acceptance_rate)
-                    bin_counts.append(np.sum(bin_mask))
+
+        # ---------- 分箱策略工具 ----------
+        def compute_global_bins(conf_arr: np.ndarray, bins: int, method: str) -> np.ndarray:
+            """返回严格覆盖[min, max]的全局分箱边界（升序，长度 = bins + 1）"""
+            if conf_arr.size == 0:
+                # 退化：给一个[0,1]区间
+                return np.linspace(0.0, 1.0, bins + 1)
+
+            cmin, cmax = float(np.min(conf_arr)), float(np.max(conf_arr))
+            if method == "equal_frequency":
+                # 等频：使用分位数；去重后若太少，降级为等距
+                q = np.linspace(0, 1, bins + 1)
+                edges = np.quantile(conf_arr, q)
+                edges = np.unique(edges)
+                if edges.size < 3:  # 去重后过少，回退等距
+                    edges = np.linspace(cmin, cmax, bins + 1)
                 else:
-                    bin_acceptance_rates.append(np.nan)
-                    bin_counts.append(0)
-            
-            # 只绘制有数据的点
-            valid_mask = ~np.isnan(bin_acceptance_rates)
-            if np.sum(valid_mask) > 0:
-                plt.plot(bin_centers[valid_mask], np.array(bin_acceptance_rates)[valid_mask], 
-                        'o-', color=colors[i], label=f'Q{i+1}', alpha=0.8, markersize=6, linewidth=2)
-        
-        # 添加完美校准线
-        plt.plot([0, 1], [0, 1], 'r--', alpha=0.7, linewidth=3, label='Perfect Calibration')
-        plt.xlabel('Draft Confidence', fontsize=14)
-        plt.ylabel('True Acceptance Rate', fontsize=14)
-        plt.title('Conditional Reliability Diagram by Attention Quantiles', fontsize=16, fontweight='bold')
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.xlim(0, 1)
-        plt.ylim(0, 1)
-        plt.tight_layout()
-        
-        # 保存第二个图
-        save_path_2 = os.path.join(save_dir, "cross_modal_attention_reliability_diagram.png")
-        plt.savefig(save_path_2, dpi=300, bbox_inches='tight')
-        plt.close()
-        saved_paths.append(save_path_2)
-        
-        # ========== 图3: 二维热力图：置信度×注意力分位数 ==========
-        plt.figure(figsize=(14, 8))
-        
-        # 创建二维网格
-        confidence_bins = np.linspace(0, 1, num_bins + 1)
-        heatmap_data = np.zeros((num_quantiles, num_bins))
-        heatmap_counts = np.zeros((num_quantiles, num_bins))
-        
-        for i in range(num_quantiles):
-            for j in range(num_bins):
-                # 找到属于当前网格的数据点
-                quantile_mask = quantile_labels == i
-                if j == num_bins - 1:
-                    confidence_mask = (confidences >= confidence_bins[j]) & (confidences <= confidence_bins[j+1])
-                else:
-                    confidence_mask = (confidences >= confidence_bins[j]) & (confidences < confidence_bins[j+1])
-                
-                combined_mask = quantile_mask & confidence_mask
-                
-                if np.sum(combined_mask) > 0:
-                    acceptance_rate = np.mean(acceptances[combined_mask])
-                    heatmap_data[i, j] = acceptance_rate
-                    heatmap_counts[i, j] = np.sum(combined_mask)
-                else:
-                    heatmap_data[i, j] = np.nan
-        
-        # 创建热力图
-        im = plt.imshow(heatmap_data, cmap='RdYlBu_r', aspect='auto', vmin=0, vmax=1)
-        
-        # 设置坐标轴标签
-        plt.xticks(np.arange(0, num_bins, 4), [f'{confidence_bins[i]:.1f}' for i in range(0, num_bins, 4)])
-        plt.yticks(np.arange(num_quantiles), [f'Q{i+1}' for i in range(num_quantiles)])
-        
-        plt.xlabel('Draft Confidence', fontsize=14)
-        plt.ylabel('Attention Quantiles', fontsize=14)
-        plt.title('Confidence × Attention Quantiles Heatmap\n(Color = True Acceptance Rate)', fontsize=16, fontweight='bold')
-        
-        # 添加颜色条
-        cbar = plt.colorbar(im, shrink=0.8)
-        cbar.set_label('True Acceptance Rate', fontsize=13)
-        
-        # 在热力图上添加数值标签（仅显示有足够样本的格子）
-        for i in range(num_quantiles):
-            for j in range(num_bins):
-                if heatmap_counts[i, j] >= 5:  # 只显示样本数>=5的格子
-                    text = f'{heatmap_data[i, j]:.2f}\n({int(heatmap_counts[i, j])})'
-                    plt.text(j, i, text, ha="center", va="center", 
-                            color="white" if heatmap_data[i, j] < 0.5 else "black", fontsize=10)
-        
-        plt.tight_layout()
-        
-        # 保存第三个图
-        save_path_3 = os.path.join(save_dir, "cross_modal_attention_heatmap.png")
-        plt.savefig(save_path_3, dpi=300, bbox_inches='tight')
-        plt.close()
-        saved_paths.append(save_path_3)
-        
-        # 打印统计信息
-        print(f"跨模态注意力分析图已保存:")
-        print(f"  1. 接受率分析: {save_path_1}")
-        print(f"  2. 可靠性图: {save_path_2}")
-        print(f"  3. 热力图: {save_path_3}")
-        print(f"总样本数: {len(token_data)}")
+                    edges[0] = cmin
+                    edges[-1] = cmax
+            elif method == "equal_width":
+                edges = np.linspace(cmin, cmax, bins + 1)
+            else:
+                raise ValueError(f"Unknown binning method: {method}")
+            # 确保严格单调非降（避免数值抖动导致相等）
+            # 若仍出现重复边界，少数空箱是允许的；下游逻辑会跳过空箱
+            return edges
+
+        # 决定需要运行的分箱方法
+        if confidence_binning not in ("equal_frequency", "equal_width", "both"):
+            raise ValueError("confidence_binning must be 'equal_frequency', 'equal_width', or 'both'")
+
+        binning_methods = (
+            ["equal_frequency", "equal_width"] if confidence_binning == "both"
+            else [confidence_binning]
+        )
+
+        # ---------- 针对每种置信度分箱方法，分别画 图2 与 图3 ----------
+        for method in binning_methods:
+            global_bin_edges = compute_global_bins(confidences, num_bins, method)
+            global_bin_centers = (global_bin_edges[:-1] + global_bin_edges[1:]) / 2.0
+            actual_num_bins = len(global_bin_edges) - 1
+            method_tag = "EF" if method == "equal_frequency" else "EW"
+            method_name = "Global Equal-Frequency" if method == "equal_frequency" else "Equal-Width"
+
+            # ---- 图2：可靠性图（按注意力分位数条件化 + 全局置信度分箱） ----
+            plt.figure(figsize=(12, 8))
+            colors = plt.cm.viridis(np.linspace(0, 1, actual_quantiles))
+
+            for qi in range(actual_quantiles):
+                mask_q = (quantile_labels == qi)
+                if np.sum(mask_q) < 10:
+                    continue
+
+                q_confidences = confidences[mask_q]
+                q_acceptances = acceptances[mask_q]
+
+                bin_acceptance_rates = []
+                for j in range(actual_num_bins):
+                    # 注意最后一个 bin 包含右端点
+                    if j == actual_num_bins - 1:
+                        bin_mask = (q_confidences >= global_bin_edges[j]) & (q_confidences <= global_bin_edges[j+1])
+                    else:
+                        bin_mask = (q_confidences >= global_bin_edges[j]) & (q_confidences <  global_bin_edges[j+1])
+
+                    if np.any(bin_mask):
+                        bin_acceptance_rates.append(float(np.mean(q_acceptances[bin_mask])))
+                    else:
+                        bin_acceptance_rates.append(np.nan)
+
+                # 只绘制非 NaN
+                br = np.array(bin_acceptance_rates, dtype=float)
+                valid = ~np.isnan(br)
+                if np.any(valid):
+                    plt.plot(global_bin_centers[valid], br[valid], 'o-', color=colors[qi],
+                            label=f'Q{qi+1}', alpha=0.85, markersize=6, linewidth=2)
+
+            plt.plot([0, 1], [0, 1], 'r--', alpha=0.7, linewidth=3, label='Perfect Calibration')
+            plt.xlabel('Draft Confidence', fontsize=14)
+            plt.ylabel('True Acceptance Rate', fontsize=14)
+            plt.title(f'Conditional Reliability Diagram by Attention Quantiles\n({method_name} Confidence Binning)',
+                    fontsize=16, fontweight='bold')
+            plt.legend(fontsize=12)
+            plt.grid(True, alpha=0.3)
+            plt.xlim(0, 1)
+            plt.ylim(0, 1)
+            plt.tight_layout()
+
+            save_path_2 = os.path.join(save_dir, f"cross_modal_attention_reliability_diagram_{method_tag}.png")
+            plt.savefig(save_path_2, dpi=300, bbox_inches='tight')
+            plt.close()
+            saved_paths.append(save_path_2)
+
+            # ---- 图3：二维热力图（注意力分位数 × 全局置信度分箱） ----
+            plt.figure(figsize=(14, 8))
+            heatmap_data = np.zeros((actual_quantiles, actual_num_bins))
+            heatmap_counts = np.zeros((actual_quantiles, actual_num_bins))
+
+            for qi in range(actual_quantiles):
+                quantile_mask = (quantile_labels == qi)
+                if not np.any(quantile_mask):
+                    heatmap_data[qi, :] = np.nan
+                    continue
+
+                for j in range(actual_num_bins):
+                    if j == actual_num_bins - 1:
+                        confidence_mask = (confidences >= global_bin_edges[j]) & (confidences <= global_bin_edges[j+1])
+                    else:
+                        confidence_mask = (confidences >= global_bin_edges[j]) & (confidences <  global_bin_edges[j+1])
+
+                    combined = quantile_mask & confidence_mask
+                    cnt = int(np.sum(combined))
+                    if cnt > 0:
+                        heatmap_data[qi, j] = float(np.mean(acceptances[combined]))
+                        heatmap_counts[qi, j] = cnt
+                    else:
+                        heatmap_data[qi, j] = np.nan
+
+            im = plt.imshow(heatmap_data, cmap='RdYlBu_r', aspect='auto', vmin=0, vmax=1)
+            # X 轴：为了可读性，采样少量刻度
+            step = max(1, actual_num_bins // 5)
+            x_tick_indices = np.arange(0, actual_num_bins, step)
+            x_tick_labels = [f'{global_bin_edges[i]:.2f}' for i in x_tick_indices]
+            plt.xticks(x_tick_indices, x_tick_labels)
+            plt.yticks(np.arange(actual_quantiles), [f'Q{i+1}' for i in range(actual_quantiles)])
+
+            plt.xlabel('Draft Confidence', fontsize=14)
+            plt.ylabel('Attention Quantiles', fontsize=14)
+            plt.title(f'Confidence × Attention Quantiles Heatmap\n({method_name} Confidence Binning, Color = True Acceptance Rate)',
+                    fontsize=16, fontweight='bold')
+
+            cbar = plt.colorbar(im, shrink=0.8)
+            cbar.set_label('True Acceptance Rate', fontsize=13)
+
+            # 标注数值（样本数>=5）
+            for qi in range(actual_quantiles):
+                for j in range(actual_num_bins):
+                    if heatmap_counts[qi, j] >= 5 and not np.isnan(heatmap_data[qi, j]):
+                        txt = f'{heatmap_data[qi, j]:.2f}\n({int(heatmap_counts[qi, j])})'
+                        plt.text(j, qi, txt, ha="center", va="center",
+                                color="white" if heatmap_data[qi, j] < 0.5 else "black", fontsize=10)
+
+            plt.tight_layout()
+            save_path_3 = os.path.join(save_dir, f"cross_modal_attention_heatmap_{method_tag}.png")
+            plt.savefig(save_path_3, dpi=300, bbox_inches='tight')
+            plt.close()
+            saved_paths.append(save_path_3)
+
+            # ---- 统计信息 ----
+            print(f"[{method_name}] 跨模态注意力分析图已保存：")
+            print(f"  - 可靠性图: {save_path_2}")
+            print(f"  - 热力图:   {save_path_3}")
+
+        # 全局统计输出（一次即可）
+        print(f"总样本数: {N}")
+        print(f"全局置信度范围: {confidences.min():.4f} - {confidences.max():.4f}")
         print("各分位数样本分布:")
-        for i in range(num_quantiles):
-            count = np.sum(quantile_labels == i)
-            avg_attention = np.mean(cross_modal_scores[quantile_labels == i]) if count > 0 else 0
-            avg_acceptance = np.mean(acceptances[quantile_labels == i]) if count > 0 else 0
-            print(f"  Q{i+1}: {count} 样本, 平均注意力={avg_attention:.4f}, 平均接受率={avg_acceptance:.3f}")
-        
+        for i in range(actual_quantiles):
+            count = int(np.sum(quantile_labels == i))
+            avg_attention = float(np.mean(cross_modal_scores[quantile_labels == i])) if count > 0 else 0.0
+            avg_acceptance = float(np.mean(acceptances[quantile_labels == i])) if count > 0 else 0.0
+            q_confidences = confidences[quantile_labels == i]
+            conf_range = f"{float(q_confidences.min()):.3f}-{float(q_confidences.max()):.3f}" if count > 0 else "N/A"
+            print(f"  Q{i+1}: {count} 样本, 平均注意力={avg_attention:.4f}, 平均接受率={avg_acceptance:.3f}, 置信度范围={conf_range}")
+
         return saved_paths
 
     def _make_json_serializable(self, obj):
@@ -594,7 +828,7 @@ class CalibrationLogger:
             'summary': {
                 'total_sessions': len(self.draft_sessions),
                 'total_tokens': len(token_data),
-                'avg_confidence': float(np.mean([item['confidence'] for item in token_data])) if token_data else 0,
+                'avg_confidence': float(np.mean([item.get('path_confidence', item.get('confidence', 0.0)) for item in token_data])) if token_data else 0,
                 'avg_acceptance_rate': float(np.mean([item['is_accepted'] for item in token_data])) if token_data else 0,
                 'avg_cross_modal_attention': float(np.mean([item['cross_modal_attention'] for item in token_data])) if token_data else 0
             }
@@ -607,17 +841,29 @@ class CalibrationLogger:
         
         # 保存为numpy文件（便于后续分析）
         if token_data:
-            confidence_scores = np.array([item['confidence'] for item in token_data])
+            # 支持新的多种置信度字段
+            path_confidence_scores = np.array([item.get('path_confidence', item.get('confidence', 0.0)) for item in token_data])
+            local_confidence_scores = np.array([item.get('local_confidence', item.get('confidence', 0.0)) for item in token_data])
             acceptance_labels = np.array([item['is_accepted'] for item in token_data])
             tokens = np.array([item['token'] for item in token_data])
             cross_modal_attention = np.array([item['cross_modal_attention'] for item in token_data])
             
+            # 新增的树位置信息
+            tree_positions = np.array([item.get('tree_position', 0) for item in token_data])
+            tree_depths = np.array([item.get('tree_depth', 0) for item in token_data])
+            parent_positions = np.array([item.get('parent_position', 0) for item in token_data])
+            
             np_path = os.path.join(self.save_dir, f"{filename_prefix}.npz")
             np.savez(np_path, 
-                    confidence_scores=confidence_scores,
+                    path_confidence_scores=path_confidence_scores,
+                    local_confidence_scores=local_confidence_scores,
+                    confidence_scores=path_confidence_scores,  # 保持向后兼容
                     acceptance_labels=acceptance_labels,
                     tokens=tokens,
-                    cross_modal_attention=cross_modal_attention)
+                    cross_modal_attention=cross_modal_attention,
+                    tree_positions=tree_positions,
+                    tree_depths=tree_depths,
+                    parent_positions=parent_positions)
         
         print(f"Calibration data saved to {json_path}")
         print(f"Total draft sessions: {len(self.draft_sessions)}")
@@ -684,7 +930,7 @@ class CalibrationLogger:
             'bin_counts': bin_counts
         }
 
-    def calculate_ece(self, confidence_scores, acceptance_labels, num_bins=20):
+    def calculate_ece(self, confidence_scores, acceptance_labels, num_bins=20, use_equal_frequency=True):
         """
         计算ECE（期望校准误差）
         
@@ -692,6 +938,7 @@ class CalibrationLogger:
             confidence_scores: 置信度分数数组
             acceptance_labels: 接受标签数组
             num_bins: 分箱数量
+            use_equal_frequency: 是否使用等频分箱（推荐True）
             
         Returns:
             float: ECE值
@@ -699,15 +946,31 @@ class CalibrationLogger:
         confidence_scores = np.array(confidence_scores)
         acceptance_labels = np.array(acceptance_labels)
         
-        # 创建等宽分箱
-        bin_boundaries = np.linspace(0, 1, num_bins + 1)
-        bin_indices = np.digitize(confidence_scores, bin_boundaries) - 1
-        bin_indices = np.clip(bin_indices, 0, num_bins - 1)
+        if use_equal_frequency:
+            # 使用等频分箱：每个分箱包含相等数量的样本
+            quantiles = np.linspace(0, 1, num_bins + 1)
+            bin_boundaries = np.quantile(confidence_scores, quantiles)
+            # 确保边界值的唯一性，避免重复边界
+            bin_boundaries = np.unique(bin_boundaries)
+            if len(bin_boundaries) < num_bins + 1:
+                # 如果唯一边界数量不足，回退到等距分箱
+                print(f"Warning: 置信度值重复过多，回退到等距分箱。唯一边界数: {len(bin_boundaries)}")
+                bin_boundaries = np.linspace(0, 1, num_bins + 1)
+            
+            bin_indices = np.digitize(confidence_scores, bin_boundaries) - 1
+            bin_indices = np.clip(bin_indices, 0, len(bin_boundaries) - 2)
+            actual_num_bins = len(bin_boundaries) - 1
+        else:
+            # 原始的等距分箱
+            bin_boundaries = np.linspace(0, 1, num_bins + 1)
+            bin_indices = np.digitize(confidence_scores, bin_boundaries) - 1
+            bin_indices = np.clip(bin_indices, 0, num_bins - 1)
+            actual_num_bins = num_bins
         
         ece = 0.0
         total_samples = len(confidence_scores)
         
-        for i in range(num_bins):
+        for i in range(actual_num_bins):
             mask = bin_indices == i
             if np.sum(mask) > 0:
                 bin_confidence = np.mean(confidence_scores[mask])
@@ -833,8 +1096,9 @@ class CalibrationLogger:
         if not token_data:
             return {}
         
-        # 提取confidence scores和acceptance labels
-        confidence_scores = np.array([item['confidence'] for item in token_data])
+        # 提取confidence scores和acceptance labels（支持新的置信度字段）
+        # 优先使用path_confidence，如果没有则使用旧的confidence字段
+        confidence_scores = np.array([item.get('path_confidence', item.get('confidence', 0.0)) for item in token_data])
         acceptance_labels = np.array([item['is_accepted'] for item in token_data])
         
         # 计算总体acceptance rate (移到这里，在绘图之前)

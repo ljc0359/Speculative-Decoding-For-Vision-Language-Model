@@ -416,27 +416,28 @@ class Model(nn.Module):
         if CALIBRATION_LOGGING_ENABLED:
             logger = get_calibration_logger()
             
-            # 检测图像token位置
-            img_start_idx = None
-            img_end_idx = None
+            # 使用新的图像token位置计算方法
+            from eagle.model.image_token_utils import calculate_image_token_positions_for_calibration
             
-            # 检测LLaVA的图像token (-200)
-            if -200 in input_ids:
-                img_positions = (input_ids == -200).nonzero(as_tuple=True)[1]
-                if len(img_positions) > 0:
-                    img_start_idx = img_positions[0].item()
-                    img_end_idx = img_positions[-1].item() + 1
+            # 尝试从inputs_embeds推断图像token位置
+            # 注意：这里的input_ids已经是去掉第一个token的，需要恢复原始形状
+            original_input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
             
-            # 检测Qwen2VL的图像token (151652, 151655等)
-            qwen_image_tokens = [151652, 151655]
-            for token_id in qwen_image_tokens:
-                if token_id in input_ids:
-                    img_positions = (input_ids == token_id).nonzero(as_tuple=True)[1]
-                    if len(img_positions) > 0:
-                        if img_start_idx is None:
-                            img_start_idx = img_positions[0].item()
-                        img_end_idx = max(img_end_idx or 0, img_positions[-1].item() + 1)
+            img_start_idx, img_end_idx = calculate_image_token_positions_for_calibration(
+                input_ids=original_input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=None,  # 在这个阶段我们没有原始的image_features
+                batch_idx=0
+            )
             
+            # 由于input_ids已经去掉了第一个token，需要调整位置
+            if img_start_idx is not None:
+                img_start_idx = max(0, img_start_idx - 1)
+            if img_end_idx is not None:
+                img_end_idx = max(0, img_end_idx - 1)
+            
+            print("img_start_idx, img_end_idx", img_start_idx, img_end_idx)
+
             logger.start_draft_session(img_start_idx=img_start_idx, img_end_idx=img_end_idx)
 
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
@@ -459,10 +460,37 @@ class Model(nn.Module):
         last_headout = head(last_hidden)
 
         last_p = self.logsoftmax(last_headout)
+        
+        # 新增：记录局部置信度和树位置信息
+        local_scores_list = []  # 每层的局部log概率
+        token_list = []         # 每层的token
+        position_labels_list = []  # 每层的BFS位置标签
+        depth_labels_list = []     # 每层的深度标签
+        parent_labels_list = []    # 每层的父节点位置标签
+        
+        # 初始化位置计数器
+        next_position_idx = 1  # BFS位置从P1开始
+        
+        # --- 第 0 层 ---
         top = torch.topk(last_p, top_k, dim=-1)
-        topk_index, topk_p = top.indices, top.values
-        scores = topk_p[0]
-        scores_list.append(scores[None])
+        topk_index, topk_p = top.indices, top.values           # [1, K] 的 logprob
+        scores = topk_p[0]                                     # 累计分数(=局部分数)
+        scores_list.append(scores[None])                       # 存储累计分数
+        
+        # 记录第0层的局部分数和位置信息
+        local_scores_list.append(topk_p)  # 第0层的局部分数就是topk_p
+        token_list.append(topk_index)
+        
+        # 第0层：根节点的直接子节点，深度为1，父节点位置为0
+        layer_positions = torch.arange(next_position_idx, next_position_idx + top_k, device=topk_index.device)
+        layer_depths = torch.ones(top_k, device=topk_index.device)
+        layer_parents = torch.zeros(top_k, device=topk_index.device)
+        
+        position_labels_list.append(layer_positions)
+        depth_labels_list.append(layer_depths)
+        parent_labels_list.append(layer_parents)
+        next_position_idx += top_k
+        
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
         ss_token.append(topk_index)
         input_ids = topk_index
@@ -470,7 +498,7 @@ class Model(nn.Module):
         tree_mask = self.tree_mask_init
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
 
-        # 4
+        # 后续层的处理
         for i in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
@@ -479,7 +507,6 @@ class Model(nn.Module):
                                                position_ids=position_ids, use_cache=True)
             len_posi += 1
 
-            # with Timer("sort1"):
             bias1 = top_k if i > 0 else 0
             bias2 = max(0, i - 1)
             bias = 1 + top_k ** 2 * bias2 + bias1
@@ -489,58 +516,111 @@ class Model(nn.Module):
             last_headout = head(out_hidden[0])
             last_p = self.logsoftmax(last_headout)
 
-            top = torch.topk(last_p, top_k, dim=-1)
-            topk_index, topk_p = top.indices, top.values
+            # --- 之后每一层 ---
+            top = torch.topk(last_p, top_k, dim=-1)                # [K, K]
+            topk_index, topk_p = top.indices, top.values           # logprob（局部）
 
-            cu_scores = topk_p + scores[:, None]
+            cu_scores = topk_p + scores[:, None]                   # 累计分数
 
             topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
             scores = topk_cs_p
-
+            
             out_ids = topk_cs_index // top_k
             input_hidden = out_hidden[:, out_ids]
             input_ids = topk_index.view(-1)[topk_cs_index][None]
 
             ss_token.append(topk_index)
-            scores_list.append(cu_scores)
+            scores_list.append(cu_scores)                          # 存储累计分数
+            
+            # 记录当前层的局部分数和位置信息
+            local_scores_list.append(topk_p)  # 局部分数 [K, K]
+            token_list.append(topk_index)     # token [K, K]
+            
+            # 计算当前层所有KxK候选的位置信息
+            current_depth = i + 2  # 深度从1开始，第i层的深度是i+2
+            layer_positions = torch.arange(next_position_idx, next_position_idx + top_k * top_k, device=topk_index.device)
+            layer_depths = torch.full((top_k * top_k,), current_depth, device=topk_index.device)
+            
+            # 计算父节点位置：每个父节点有top_k个子节点
+            parent_positions_for_layer = []
+            for parent_idx in range(top_k):
+                # 获取父节点在上一层的位置标签
+                if i == 0:  # 第1层，父节点是第0层的节点
+                    parent_pos = position_labels_list[0][parent_idx].item()
+                else:  # 后续层，父节点是上一层被选中的节点
+                    # 需要根据topk_cs_index找到对应的父节点位置
+                    # 这里简化处理，使用上一层的位置信息
+                    parent_pos = next_position_idx - top_k * top_k + parent_idx * top_k
+                
+                parent_positions_for_layer.extend([parent_pos] * top_k)
+            
+            layer_parents = torch.tensor(parent_positions_for_layer, device=topk_index.device)
+            
+            position_labels_list.append(layer_positions)
+            depth_labels_list.append(layer_depths)
+            parent_labels_list.append(layer_parents)
+            next_position_idx += top_k * top_k
+            
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
 
-        scores_list = torch.cat(scores_list, dim=0).view(-1)
+        # 获取所有候选的分数和token
+        scores_flat = torch.cat(scores_list, dim=0).reshape(-1)        # 累计分数
+        local_scores_flat = torch.cat(local_scores_list, dim=0).reshape(-1)  # 局部分数
+        tokens_flat = torch.cat(token_list, dim=0).reshape(-1)         # tokens
+        positions_flat = torch.cat(position_labels_list, dim=0).reshape(-1)  # 位置
+        depths_flat = torch.cat(depth_labels_list, dim=0).reshape(-1)        # 深度
+        parents_flat = torch.cat(parent_labels_list, dim=0).reshape(-1)      # 父节点位置
+        
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
-        top_scores = torch.topk(scores_list, total_tokens, dim=-1)
+        
+        # 选择最终的draft tokens
+        top_scores = torch.topk(scores_flat, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
 
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
-
-        # 记录最终选择的draft tokens的confidence scores
+        
+        # 记录最终被选中的draft tokens的所有信息
         if CALIBRATION_LOGGING_ENABLED:
             logger = get_calibration_logger()
-            final_scores = scores_list[top_scores_index]
-            logger.log_draft_confidence(final_scores, draft_tokens[1:])  # 排除sample_token
-
+            # 获取最终选中的tokens的各种信息（不包括sample_token）
+            selected_path_scores = scores_flat[top_scores_index]      # 路径累计分数
+            selected_local_scores = local_scores_flat[top_scores_index]  # 局部分数
+            selected_tokens = draft_tokens[1:]                        # 排除sample_token
+            selected_positions = positions_flat[top_scores_index]     # 树位置
+            selected_depths = depths_flat[top_scores_index]           # 树深度
+            selected_parents = parents_flat[top_scores_index]         # 父节点位置
+            
+            # 记录所有信息
+            logger.log_draft_confidence(
+                path_confidence_scores=selected_path_scores,
+                local_confidence_scores=selected_local_scores,
+                draft_tokens=selected_tokens,
+                tree_positions=selected_positions,
+                tree_depths=selected_depths,
+                parent_positions=selected_parents
+            )
+        
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
-        # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
         mask_index[draft_parents == 0] = -1
         mask_index = mask_index + 1
         mask_index_list = mask_index.tolist()
-        # with Timer("mask"):
+        
         tree_mask = torch.eye(total_tokens + 1).bool()
         tree_mask[:, 0] = True
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
-
+        
         tree_position_ids = torch.sum(tree_mask, dim=1) - 1
 
         tree_mask = tree_mask.float()[None, None]
         draft_tokens = draft_tokens[None]
 
         del parents_list, scores_list, ss_token, ss_token_list, draft_parents
-
-        # with Timer("retrieve"):
+        del local_scores_list, token_list, position_labels_list, depth_labels_list, parent_labels_list
 
         max_depth = torch.max(tree_position_ids) + 1
         noleaf_index = torch.unique(mask_index).tolist()
@@ -566,7 +646,6 @@ class Model(nn.Module):
             maxitem = total_tokens + 5
 
             def custom_sort(lst):
-                # sort_keys=[len(list)]
                 sort_keys = []
                 for i in range(len(lst)):
                     sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
@@ -577,7 +656,7 @@ class Model(nn.Module):
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
-
+        
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
     @torch.no_grad()

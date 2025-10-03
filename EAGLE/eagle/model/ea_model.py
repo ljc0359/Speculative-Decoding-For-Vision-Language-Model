@@ -301,23 +301,28 @@ class EaModel(nn.Module):
             CALIBRATION_LOGGING_ENABLED = False
             calibration_logger = None
 
-        # # 检测图像token位置
-        # img_start_idx, img_end_idx = None, None
-        # if enable_attention_logging and input_ids is not None:
-        #     # 对于LLaVA模型，检测-200 token
-        #     if -200 in input_ids:
-        #         img_indices = torch.where(input_ids == -200)
-        #         if len(img_indices[1]) > 0:
-        #             img_start_idx = img_indices[1][0].item()
-        #             img_end_idx = img_start_idx + 576  # LLaVA图像token数量
-        #     # 对于Qwen2VL模型，检测151652 token
-        #     elif 151652 in input_ids:
-        #         img_indices = torch.where(input_ids == 151652)
-        #         if len(img_indices[1]) > 0:
-        #             img_start_idx = img_indices[1][0].item()
-        #             # 计算图像token数量
-        #             img_token_count = (input_ids == 151655).sum().item()
-        #             img_end_idx = img_start_idx + img_token_count
+        # 提取图像特征信息用于calibration logging
+        image_features_for_calibration = None
+        if CALIBRATION_LOGGING_ENABLED and inputs_embeds is not None and input_ids is not None:
+            try:
+                from eagle.model.image_token_utils import calculate_image_token_positions_for_calibration
+                
+                # 计算正确的图像token位置
+                img_start_idx, img_end_idx = calculate_image_token_positions_for_calibration(
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    image_features=None,
+                    batch_idx=0
+                )
+                
+                # 如果找到了图像token位置，提取对应的特征
+                if img_start_idx is not None and img_end_idx is not None:
+                    # 从inputs_embeds中提取图像特征
+                    image_features_for_calibration = [inputs_embeds[0, img_start_idx:img_end_idx]]
+                    
+            except Exception as e:
+                print(f"Warning: Failed to extract image features for calibration: {e}")
+                exit(1)
 
         padding=(torch.zeros(1,1,dtype=torch.long)-1).to(input_ids.device)
         input_ids = input_ids.clone()

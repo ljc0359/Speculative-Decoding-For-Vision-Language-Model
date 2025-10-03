@@ -553,7 +553,7 @@ class Llava_MSD(lmms):
             
             eval_logger.info("Calibration data saved successfully")
 
-            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(save_path="/root/Speculative_decoding/Cross_Attention", num_quantiles=5, confidence_binning="both")
+            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(save_path="/root/Speculative_decoding/Cross_Attention")
 
         # Print overall average acceptance length for this evaluation
         if self.use_msd and self.total_accept_steps > 0:
