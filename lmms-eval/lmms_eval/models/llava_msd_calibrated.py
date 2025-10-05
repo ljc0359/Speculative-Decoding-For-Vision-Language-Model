@@ -53,10 +53,10 @@ else:
     best_fit_attn_implementation = "eager"
 
 
-@register_model("llava_msd")
-class Llava_MSD(lmms):
+@register_model("llava_msd_calibrated")
+class Llava_MSD_Calibrated(lmms):
     """
-    Llava Model
+    Llava Model with MSD Calibration
     """
 
     def __init__(
@@ -422,19 +422,7 @@ class Llava_MSD(lmms):
             pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
-            # These steps are not in LLaVA's original code, but are necessary for generation to work
-            # TODO: attention to this major generation step...
-            # if 58 not in doc_id:
-            #     res.extend([""] * len(contexts))  # 填充空结果
-            #     pbar.update(1)
-            #     continue
-            # # breakpoint()
             try:
-
-                # import time
-                # torch.cuda.synchronize()
-                # start_time = time.time()
-
                 inputs_embeds, attention_mask = self.model.base_model.get_inputs_embeds(input_ids,image_tensor,gen_kwargs["image_sizes"],attention_masks)
                 if self.use_msd:
                     # reset per-chunk acceptance counters
@@ -447,7 +435,8 @@ class Llava_MSD(lmms):
                         inputs_embeds=inputs_embeds, 
                         temperature=gen_kwargs["temperature"], 
                         max_new_tokens=512,
-                        enable_attention_logging=True  # 启用attention记录
+                        enable_attention_logging=True,
+                        enable_candidate_calibration=True
                     ) 
                     
                     # accumulate overall stats

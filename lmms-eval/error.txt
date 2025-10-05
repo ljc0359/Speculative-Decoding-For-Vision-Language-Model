@@ -1,0 +1,67 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:51: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Detected kernel version 5.4.250, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+Detected kernel version 5.4.250, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+You are using a model of type llava to instantiate a model of type llava_llama. This is not supported for all configurations of models and can yield errors.
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:39<00:39, 39.25s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:53<00:00, 24.67s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:53<00:00, 26.86s/it]
+You are using a model of type llava to instantiate a model of type llama. This is not supported for all configurations of models and can yield errors.
+  0%|          | 0/100 [00:00<?, ?it/s]100%|██████████| 100/100 [00:00<00:00, 98089.43it/s]
+Model Responding:   0%|          | 0/100 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/__main__.py", line 359, in cli_evaluate
+    results, samples = cli_evaluate_single(args)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/__main__.py", line 500, in cli_evaluate_single
+    results = evaluator.simple_evaluate(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/utils.py", line 533, in _wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/evaluator.py", line 259, in simple_evaluate
+    results = evaluate(
+              ^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/utils.py", line 533, in _wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/evaluator.py", line 472, in evaluate
+    resps = getattr(lm, reqtype)(cloned_reqs)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/models/llava_msd_calibrated.py", line 507, in generate_until
+    raise e
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/lmms_eval/models/llava_msd_calibrated.py", line 445, in generate_until
+    output_ids = self.model.msdgenerate(
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/EAGLE/eagle/model/ea_model.py", line 331, in msdgenerate
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+                                                                                                     ^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/EAGLE/eagle/model/utils.py", line 276, in initialize_tree
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/EAGLE/eagle/model/cnets.py", line 527, in topK_genrate
+    outputs0, orig0, _ = base_model(
+                         ^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/EAGLE/eagle/model/ea_model.py", line 217, in forward
+    outputs = self.base_model.model(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/EAGLE/eagle/model/modeling_llama_kv.py", line 971, in forward
+    past_key_values_length = past_key_values[0][0].shape[2]
+                             ~~~~~~~~~~~~~~~~~~^^^
+TypeError: 'NoneType' object is not subscriptable
+Model Responding:   0%|          | 0/100 [00:00<?, ?it/s]

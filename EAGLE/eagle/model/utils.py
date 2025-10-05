@@ -255,8 +255,9 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_embeds=None):
+def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_embeds=None, enable_candidate_calibration=False):
 
+    # print(f"[DEBUG] {past_key_values}")
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True, inputs_embeds=inputs_embeds
     )
@@ -273,7 +274,17 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
     # Clone the output hidden states
 
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor, inputs_embeds)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        head=model.base_model.lm_head,
+        logits_processor=logits_processor,
+        draft_past_key_values=outputs.past_key_values,   # 第一次前向返回的KV（可能为None）
+        inputs_embeds=inputs_embeds,
+        enable_candidate_calibration=enable_candidate_calibration,
+        base_model=model,
+        context_past_key_values=past_key_values          # 初始化构建的KVCache（非None）
+    )
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
 
@@ -472,7 +483,9 @@ def update_inference_inputs(
         current_length_data,
         model,
         hidden_state_new,
-        sample_p
+        sample_p,
+        inputs_embeds=None,                 # 新增：从上游传入
+        enable_candidate_calibration=True   # 新增：记录所有候选
 ):
     prev_input_len = input_ids.shape[1]
     if -200 in input_ids:
@@ -509,12 +522,20 @@ def update_inference_inputs(
         token = torch.argmax(prob)
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                              head=model.base_model.lm_head,logits_processor=logits_processor)
+    draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
+        hidden_states=accept_hidden_state_new,
+        input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+        head=model.base_model.lm_head,
+        logits_processor=logits_processor,
+        draft_past_key_values=None,                      # 二次生成树不延续上轮present
+        inputs_embeds=inputs_embeds,                     # 传入原始context的embeds
+        enable_candidate_calibration=enable_candidate_calibration,  # 开启候选校准
+        base_model=model,
+        context_past_key_values=model.past_key_values,   # 使用初始化的KVCache作为上下文KV
+    )
 
     new_token += accept_length + 1
-
+    
     return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
 
 

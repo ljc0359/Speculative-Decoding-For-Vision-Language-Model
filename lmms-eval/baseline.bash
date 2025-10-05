@@ -1,5 +1,5 @@
   python -m lmms_eval \
-    --model llava_msd \
+    --model llava_msd_calibrated \
     --model_args pretrained="/root/Speculative_decoding/checkpoint/llava-v1.5-7b" \
     --msd_model_path /root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-7B \
     --tasks chartqa \
@@ -8,4 +8,4 @@
     --use_msd \
     --log_samples \
     --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/baseline.json \
-    --limit 2300
+    --limit 2300 > log.txt

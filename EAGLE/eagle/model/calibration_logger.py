@@ -189,7 +189,7 @@ class CalibrationLogger:
                 if token_idx < 5:
                     img_attention_mean = img_attention_matrix[token_idx].mean().item()
                     img_attention_max = img_attention_matrix[token_idx].max().item()
-                    print(f"DEBUG: candidate_token_{token_idx} -> img_attention: sum={img_attention_sum:.6f}, mean={img_attention_mean:.6f}, max={img_attention_max:.6f}")
+                    # print(f"DEBUG: candidate_token_{token_idx} -> img_attention: sum={img_attention_sum:.6f}, mean={img_attention_mean:.6f}, max={img_attention_max:.6f}")
             
             # 统计信息
             if cross_modal_scores:
@@ -201,6 +201,30 @@ class CalibrationLogger:
             import traceback
             traceback.print_exc()
             return []
+    
+    def log_candidate_calibration_data(self, candidate_data: List[Dict]):
+        """
+        记录candidate calibration数据，用于训练isotonic calibration
+        
+        Args:
+            candidate_data: 包含每个candidate的信息列表，每个元素包含：
+                - layer: 候选token所在的层级
+                - position_in_layer: 在该层中的位置
+                - candidate_token: 候选token的ID
+                - draft_confidence: draft model的置信度（概率值）
+                - base_confidence: base model的置信度（概率值）
+                - tree_position: 在树中的BFS位置
+                - tree_depth: 树深度
+                - parent_position: 父节点位置
+        """
+        if not CALIBRATION_LOGGING_ENABLED or self.current_session is None:
+            return
+        
+        # 将candidate calibration数据添加到当前session
+        if 'candidate_calibration_data' not in self.current_session:
+            self.current_session['candidate_calibration_data'] = []
+        
+        self.current_session['candidate_calibration_data'].extend(candidate_data)
     
     def log_acceptance(self, accepted_length: int, draft_tokens=None, best_candidate=None):
         """记录acceptance结果"""
@@ -509,7 +533,7 @@ class CalibrationLogger:
     def plot_cross_modal_attention_comprehensive_analysis(
         self,
         save_path: Optional[str] = None, 
-        num_quantiles: int = 5,
+        num_quantiles: int = 3,
         num_bins: int = 20,
         confidence_binning: str = "equal_frequency"  # "equal_frequency" | "equal_width" | "both"
     ) -> List[str]:
@@ -783,6 +807,21 @@ class CalibrationLogger:
         else:
             return obj
 
+    def get_candidate_calibration_data(self):
+        """
+        提取所有candidate calibration数据
+        
+        Returns:
+            List[Dict]: 包含所有candidate的calibration数据
+        """
+        all_candidate_data = []
+        
+        for session in self.draft_sessions:
+            if 'candidate_calibration_data' in session:
+                all_candidate_data.extend(session['candidate_calibration_data'])
+        
+        return all_candidate_data
+
     def save_data(self, filename_prefix: str = "calibration_data"):
         """
         保存收集到的数据
@@ -796,6 +835,9 @@ class CalibrationLogger:
         
         # 提取token级别的数据
         token_data = self.get_token_level_data()
+        
+        # 提取candidate calibration数据
+        candidate_calibration_data = self.get_candidate_calibration_data()
         
         # 清理draft_sessions中的不可序列化对象
         cleaned_draft_sessions = []
@@ -825,12 +867,16 @@ class CalibrationLogger:
         data = {
             'draft_sessions': cleaned_draft_sessions,
             'token_data': token_data,
+            'candidate_calibration_data': candidate_calibration_data,  # 新增candidate calibration数据
             'summary': {
                 'total_sessions': len(self.draft_sessions),
                 'total_tokens': len(token_data),
+                'total_candidates': len(candidate_calibration_data),  # 新增candidate数量统计
                 'avg_confidence': float(np.mean([item.get('path_confidence', item.get('confidence', 0.0)) for item in token_data])) if token_data else 0,
                 'avg_acceptance_rate': float(np.mean([item['is_accepted'] for item in token_data])) if token_data else 0,
-                'avg_cross_modal_attention': float(np.mean([item['cross_modal_attention'] for item in token_data])) if token_data else 0
+                'avg_cross_modal_attention': float(np.mean([item['cross_modal_attention'] for item in token_data])) if token_data else 0,
+                'avg_draft_candidate_confidence': float(np.mean([item['draft_confidence'] for item in candidate_calibration_data])) if candidate_calibration_data else 0,
+                'avg_base_candidate_confidence': float(np.mean([item['base_confidence'] for item in candidate_calibration_data])) if candidate_calibration_data else 0
             }
         }
         
@@ -853,21 +899,47 @@ class CalibrationLogger:
             tree_depths = np.array([item.get('tree_depth', 0) for item in token_data])
             parent_positions = np.array([item.get('parent_position', 0) for item in token_data])
             
+            # 保存candidate calibration数据到numpy文件
+            save_dict = {
+                'path_confidence_scores': path_confidence_scores,
+                'local_confidence_scores': local_confidence_scores,
+                'confidence_scores': path_confidence_scores,  # 保持向后兼容
+                'acceptance_labels': acceptance_labels,
+                'tokens': tokens,
+                'cross_modal_attention': cross_modal_attention,
+                'tree_positions': tree_positions,
+                'tree_depths': tree_depths,
+                'parent_positions': parent_positions
+            }
+            
+            # 如果有candidate calibration数据，也保存到numpy文件
+            if candidate_calibration_data:
+                candidate_draft_confidences = np.array([item['draft_confidence'] for item in candidate_calibration_data])
+                candidate_base_confidences = np.array([item['base_confidence'] for item in candidate_calibration_data])
+                candidate_tokens = np.array([item['candidate_token'] for item in candidate_calibration_data])
+                candidate_layers = np.array([item['layer'] for item in candidate_calibration_data])
+                candidate_tree_positions = np.array([item['tree_position'] for item in candidate_calibration_data])
+                candidate_tree_depths = np.array([item['tree_depth'] for item in candidate_calibration_data])
+                candidate_parent_positions = np.array([item['parent_position'] for item in candidate_calibration_data])
+                
+                save_dict.update({
+                    'candidate_draft_confidences': candidate_draft_confidences,
+                    'candidate_base_confidences': candidate_base_confidences,
+                    'candidate_tokens': candidate_tokens,
+                    'candidate_layers': candidate_layers,
+                    'candidate_tree_positions': candidate_tree_positions,
+                    'candidate_tree_depths': candidate_tree_depths,
+                    'candidate_parent_positions': candidate_parent_positions
+                })
+            
             np_path = os.path.join(self.save_dir, f"{filename_prefix}.npz")
-            np.savez(np_path, 
-                    path_confidence_scores=path_confidence_scores,
-                    local_confidence_scores=local_confidence_scores,
-                    confidence_scores=path_confidence_scores,  # 保持向后兼容
-                    acceptance_labels=acceptance_labels,
-                    tokens=tokens,
-                    cross_modal_attention=cross_modal_attention,
-                    tree_positions=tree_positions,
-                    tree_depths=tree_depths,
-                    parent_positions=parent_positions)
+            np.savez(np_path, **save_dict)
         
         print(f"Calibration data saved to {json_path}")
         print(f"Total draft sessions: {len(self.draft_sessions)}")
         print(f"Total token samples: {len(token_data)}")
+        if candidate_calibration_data:
+            print(f"Total candidate samples: {len(candidate_calibration_data)}")
         
         return json_path, np_path if token_data else None
 

@@ -58,6 +58,7 @@ AVAILABLE_MODELS = {
     "llama_vision": "LlamaVision",
     "aria": "Aria",
     "llava_msd": "Llava_MSD",
+    "llava_msd_calibrated": "Llava_MSD_Calibrated"
 }
 
 

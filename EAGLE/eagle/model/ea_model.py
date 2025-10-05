@@ -66,29 +66,7 @@ class EaModel(nn.Module):
                 total_tokens=total_token,
                 depth=depth,
                 top_k=top_k,
-                threshold=threshold,
-                use_uncertainty_scoring=kwargs.get('use_uncertainty_scoring', True),
-                uncertainty_stride=kwargs.get('uncertainty_stride', 1),
-                score_a=kwargs.get('score_a', 1.0),
-                score_b=kwargs.get('score_b', 0.1),
-                score_c=kwargs.get('score_c', 0.0),
-                score_d=kwargs.get('score_d', 0.4),
-                use_js=kwargs.get('use_js', False),
-                use_epi=kwargs.get('use_epi', False),
-                reorder_leaves=kwargs.get('reorder_leaves', False),
-                use_mc_alea_epi=kwargs.get('use_mc_alea_epi', True),
-                mc_samples=kwargs.get('mc_samples', 8),
-                mc_noise_std=kwargs.get('mc_noise_std', 0.3),
-                mc_temperature=kwargs.get('mc_temperature', 1.0),
-                mc_kind=kwargs.get('mc_kind', 'gauss'),
-                epi_threshold=kwargs.get('epi_threshold', 5.0),
-                alea_threshold=kwargs.get('alea_threshold', 5.0),
-                epi_center=kwargs.get('epi_center', 0.5),
-                alea_center=kwargs.get('alea_center', 0.5),
-                exploit_bonus=kwargs.get('exploit_bonus', 3.0),
-                explore_penalty=kwargs.get('explore_penalty', -0.3),
-                balance_factor=kwargs.get('balance_factor', 0.5),
-                uncertain_penalty=kwargs.get('uncertain_penalty', -0.8),
+                threshold=threshold
             )
 
         else:
@@ -242,14 +220,16 @@ class EaModel(nn.Module):
                     past_key_values=past_key_values,
                     position_ids=position_ids,
                     output_attentions=output_attentions,  # 传递给base model
+                    use_cache=True
                 )
             else:
                 outputs = self.base_model.model(
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
                     past_key_values=past_key_values,
+                    attention_mask=attention_mask,
                     position_ids=position_ids,
-                    output_attentions=output_attentions,  # 传递给base model
+                    inputs_embeds=inputs_embeds,
+                    use_cache=True  # 确保返回 KV cache
                 )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
@@ -281,6 +261,7 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             enable_attention_logging=True,  # 新增参数，控制是否启用attention记录
+            enable_candidate_calibration=False,  # 新增参数，控制是否收集candidate calibration数据
     ):
         
         max_length=max_length-self.ea_layer.total_tokens-10
@@ -348,7 +329,7 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor ,inputs_embeds
+            input_ids, self, past_key_values, logits_processor, inputs_embeds, enable_candidate_calibration
         )
         new_token = 0
 
@@ -407,10 +388,7 @@ class EaModel(nn.Module):
             
             self.acclen += accept_length
             self.accnum += 1
-            # print(accept_length)
-            
-            # 继续原有的生成逻辑...
-            #with Timer("update_inference_inputs"):
+
             input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -423,7 +401,9 @@ class EaModel(nn.Module):
                 current_length_data,
                 self,
                 hidden_state_new,
-                sample_p
+                sample_p,
+                inputs_embeds=inputs_embeds,                         # 将上游embeds传下去
+                enable_candidate_calibration=enable_candidate_calibration  # 按外部开关控制（若要强制记录，设为True）
             )
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
@@ -439,7 +419,6 @@ class EaModel(nn.Module):
             return input_ids
         else:
             return input_ids, new_token, idx
-
 
     @torch.no_grad()
     def naivegenerate(
