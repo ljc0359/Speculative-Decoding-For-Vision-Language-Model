@@ -255,9 +255,7 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_embeds=None, enable_candidate_calibration=False):
-
-    # print(f"[DEBUG] {past_key_values}")
+def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, train_calibrator=False):
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True, inputs_embeds=inputs_embeds
     )
@@ -279,11 +277,11 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_
         input_ids=input_ids,
         head=model.base_model.lm_head,
         logits_processor=logits_processor,
-        draft_past_key_values=outputs.past_key_values,   # 第一次前向返回的KV（可能为None）
         inputs_embeds=inputs_embeds,
         enable_candidate_calibration=enable_candidate_calibration,
         base_model=model,
-        context_past_key_values=past_key_values          # 初始化构建的KVCache（非None）
+        context_past_key_values=past_key_values,          # 初始化构建的KVCache（非None）
+        train_calibrator=train_calibrator
     )
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
@@ -484,8 +482,12 @@ def update_inference_inputs(
         model,
         hidden_state_new,
         sample_p,
-        inputs_embeds=None,                 # 新增：从上游传入
-        enable_candidate_calibration=True   # 新增：记录所有候选
+        enable_candidate_calibration=False,   # 新增：记录所有候选
+        tree_outputs=None,
+        image_tensor=None,
+        image_sizes=None,
+        attention_masks_for_padding=None,
+        train_calibrator=False
 ):
     prev_input_len = input_ids.shape[1]
     if -200 in input_ids:
@@ -521,18 +523,70 @@ def update_inference_inputs(
     else:
         token = torch.argmax(prob)
         token = token[None, None]
-    # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
-        hidden_states=accept_hidden_state_new,
-        input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-        head=model.base_model.lm_head,
-        logits_processor=logits_processor,
-        draft_past_key_values=None,                      # 二次生成树不延续上轮present
-        inputs_embeds=inputs_embeds,                     # 传入原始context的embeds
-        enable_candidate_calibration=enable_candidate_calibration,  # 开启候选校准
-        base_model=model,
-        context_past_key_values=model.past_key_values,   # 使用初始化的KVCache作为上下文KV
+    
+    full_input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
+
+    # 更新attention mask以匹配full_input_ids的长度
+    if attention_masks_for_padding is not None:
+        current_mask_length = attention_masks_for_padding.shape[1]
+        full_input_length = full_input_ids.shape[1]
+        
+        if full_input_length > current_mask_length:
+            # 为新添加的token创建attention mask (值为True)
+            additional_mask_length = full_input_length - current_mask_length
+            additional_mask = torch.ones(
+                (attention_masks_for_padding.shape[0], additional_mask_length),
+                dtype=attention_masks_for_padding.dtype,
+                device=attention_masks_for_padding.device
+            )
+            updated_attention_mask = torch.cat([attention_masks_for_padding, additional_mask], dim=1)
+        else:
+            updated_attention_mask = attention_masks_for_padding
+    else:
+        # 如果没有提供attention mask，创建一个全True的mask
+        updated_attention_mask = torch.ones(
+            (full_input_ids.shape[0], full_input_ids.shape[1]),
+            dtype=torch.bool,
+            device=full_input_ids.device
+        )
+
+    computed_inputs_embeds, _ = model.base_model.get_inputs_embeds(
+        input_ids=full_input_ids,
+        images=image_tensor,
+        image_sizes=image_sizes,
+        attention_mask=updated_attention_mask
     )
+
+    # 根据enable_candidate_calibration决定使用哪种流程
+    if enable_candidate_calibration:
+        # print(f"  enable_candidate_calibration: {enable_candidate_calibration}")
+        # print(f"  draft_past_key_values: {type(tree_outputs.past_key_values)} (length: {len(tree_outputs.past_key_values) if tree_outputs.past_key_values else 'None'})")
+        # print(f"  context_past_key_values: {type(model.past_key_values)} (length: {len(model.past_key_values) if model.past_key_values else 'None'})")
+        # print(f"Full input ids {full_input_ids}")
+
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
+            hidden_states=accept_hidden_state_new,                # 传递完整的hidden states
+            input_ids=full_input_ids,                        # 完整的input_ids
+            head=model.base_model.lm_head,
+            logits_processor=logits_processor,
+            inputs_embeds=computed_inputs_embeds,
+            enable_candidate_calibration=enable_candidate_calibration,  # 开启候选校准
+            base_model=model,
+            context_past_key_values=model.past_key_values,   # 使用初始化的KVCache作为上下文KV
+            train_calibrator=train_calibrator
+        )
+    else:
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
+            hidden_states=accept_hidden_state_new,           # 使用原版的部分hidden states
+            input_ids=full_input_ids,
+            head=model.base_model.lm_head,
+            logits_processor=logits_processor,
+            inputs_embeds=computed_inputs_embeds,                     # 传入原始context的embeds
+            enable_candidate_calibration=False,              # 关闭候选校准
+            base_model=model,
+            context_past_key_values=model.past_key_values,   # 使用初始化的KVCache作为上下文KV
+            train_calibrator=train_calibrator
+        )
 
     new_token += accept_length + 1
     

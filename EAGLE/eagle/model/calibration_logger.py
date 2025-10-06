@@ -26,11 +26,15 @@ class CalibrationLogger:
         
         # 初始化统计数据
         self.reset_stats()
+        
+        # 添加候选校准数据存储
+        self.candidate_calibration_data = []
     
     def reset_stats(self):
         """重置统计数据"""
         self.draft_sessions = []
         self.current_session = None
+        self.candidate_calibration_data = []
     
     def start_draft_session(self, img_start_idx: Optional[int] = None, img_end_idx: Optional[int] = None):
         """
@@ -202,29 +206,37 @@ class CalibrationLogger:
             traceback.print_exc()
             return []
     
-    def log_candidate_calibration_data(self, candidate_data: List[Dict]):
+    def log_candidate_calibration_data(self, calibration_data):
         """
-        记录candidate calibration数据，用于训练isotonic calibration
+        记录候选校准数据
         
         Args:
-            candidate_data: 包含每个candidate的信息列表，每个元素包含：
-                - layer: 候选token所在的层级
+            calibration_data: 包含候选校准信息的字典列表，每个字典包含：
+                - layer: 层索引
                 - position_in_layer: 在该层中的位置
-                - candidate_token: 候选token的ID
-                - draft_confidence: draft model的置信度（概率值）
-                - base_confidence: base model的置信度（概率值）
-                - tree_position: 在树中的BFS位置
-                - tree_depth: 树深度
-                - parent_position: 父节点位置
+                - candidate_token: 候选token ID
+                - draft_confidence: draft model的置信度
+                - base_confidence: base model的置信度
+                - tree_position: 在候选树中的位置
+                - tree_depth: 在候选树中的深度
+                - parent_position: 父节点在候选树中的位置
+                - base_top1_token: base model的top1 token是否匹配 (1/0)
+                - draft_margin: draft model的margin (top1_prob - top2_prob)
+                - base_margin: base model的margin (top1_prob - top2_prob)
+                - avg_visual_attention_intensity: 平均视觉注意力强度
         """
         if not CALIBRATION_LOGGING_ENABLED or self.current_session is None:
             return
+        
+        if not isinstance(calibration_data, list):
+            calibration_data = [calibration_data]
         
         # 将candidate calibration数据添加到当前session
         if 'candidate_calibration_data' not in self.current_session:
             self.current_session['candidate_calibration_data'] = []
         
-        self.current_session['candidate_calibration_data'].extend(candidate_data)
+        self.current_session['candidate_calibration_data'].extend(calibration_data)
+        print(f"[CALIBRATION] Logged {len(calibration_data)} candidate calibration data points")
     
     def log_acceptance(self, accepted_length: int, draft_tokens=None, best_candidate=None):
         """记录acceptance结果"""
@@ -823,41 +835,38 @@ class CalibrationLogger:
         return all_candidate_data
 
     def save_data(self, filename_prefix: str = "calibration_data"):
-        """
-        保存收集到的数据
-        
-        Args:
-            filename_prefix: 文件名前缀
-        """
+        """保存校准数据到文件"""
         if not self.draft_sessions:
-            print("No data to save")
-            return None, None
+            print("No calibration data to save")
+            return
         
-        # 提取token级别的数据
+        # 从draft sessions中提取token数据
         token_data = self.get_token_level_data()
         
-        # 提取candidate calibration数据
+        # 获取candidate calibration数据
         candidate_calibration_data = self.get_candidate_calibration_data()
         
-        # 清理draft_sessions中的不可序列化对象
+        # 清理draft sessions数据以便JSON序列化
         cleaned_draft_sessions = []
         for session in self.draft_sessions:
-            cleaned_session = session.copy()
-            # 移除或转换不可序列化的attention_weights
-            if 'attention_weights' in cleaned_session:
-                # 不保存完整的attention weights到JSON中，因为太大
-                # 只保存一些统计信息
-                attn_weights = cleaned_session['attention_weights']
-                if attn_weights is not None:
-                    if isinstance(attn_weights, torch.Tensor):
-                        attn_weights = attn_weights.detach().cpu()
-                    cleaned_session['attention_weights'] = {
-                        'shape': list(attn_weights.shape) if hasattr(attn_weights, 'shape') else None,
-                        'mean': float(attn_weights.mean()) if hasattr(attn_weights, 'mean') else None,
-                        'std': float(attn_weights.std()) if hasattr(attn_weights, 'std') else None
-                    }
+            cleaned_session = {}
+            for key, value in session.items():
+                if key == 'attention_weights':
+                    # 不保存完整的attention weights到JSON中，因为太大
+                    # 只保存一些统计信息
+                    attn_weights = value
+                    if attn_weights is not None:
+                        if isinstance(attn_weights, torch.Tensor):
+                            attn_weights = attn_weights.detach().cpu()
+                        cleaned_session['attention_weights'] = {
+                            'shape': list(attn_weights.shape) if hasattr(attn_weights, 'shape') else None,
+                            'mean': float(attn_weights.mean()) if hasattr(attn_weights, 'mean') else None,
+                            'std': float(attn_weights.std()) if hasattr(attn_weights, 'std') else None
+                        }
+                    else:
+                        cleaned_session['attention_weights'] = None
                 else:
-                    cleaned_session['attention_weights'] = None
+                    cleaned_session[key] = value
             
             # 确保其他字段也是可序列化的
             cleaned_session = self._make_json_serializable(cleaned_session)
@@ -876,7 +885,11 @@ class CalibrationLogger:
                 'avg_acceptance_rate': float(np.mean([item['is_accepted'] for item in token_data])) if token_data else 0,
                 'avg_cross_modal_attention': float(np.mean([item['cross_modal_attention'] for item in token_data])) if token_data else 0,
                 'avg_draft_candidate_confidence': float(np.mean([item['draft_confidence'] for item in candidate_calibration_data])) if candidate_calibration_data else 0,
-                'avg_base_candidate_confidence': float(np.mean([item['base_confidence'] for item in candidate_calibration_data])) if candidate_calibration_data else 0
+                'avg_base_candidate_confidence': float(np.mean([item['base_confidence'] for item in candidate_calibration_data])) if candidate_calibration_data else 0,
+                'avg_base_top1_match_rate': float(np.mean([item.get('base_top1_token', 0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
+                'avg_draft_margin': float(np.mean([item.get('draft_margin', 0.0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
+                'avg_base_margin': float(np.mean([item.get('base_margin', 0.0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
+                'avg_visual_attention_intensity': float(np.mean([item.get('avg_visual_attention_intensity', 0.0) for item in candidate_calibration_data])) if candidate_calibration_data else 0  # 新增：平均视觉注意力强度统计
             }
         }
         
@@ -922,6 +935,12 @@ class CalibrationLogger:
                 candidate_tree_depths = np.array([item['tree_depth'] for item in candidate_calibration_data])
                 candidate_parent_positions = np.array([item['parent_position'] for item in candidate_calibration_data])
                 
+                # 新增字段
+                candidate_base_top1_tokens = np.array([item.get('base_top1_token', 0) for item in candidate_calibration_data])
+                candidate_draft_margins = np.array([item.get('draft_margin', 0.0) for item in candidate_calibration_data])
+                candidate_base_margins = np.array([item.get('base_margin', 0.0) for item in candidate_calibration_data])
+                candidate_avg_visual_attention = np.array([item.get('avg_visual_attention_intensity', 0.0) for item in candidate_calibration_data])  # 新增：平均视觉注意力强度
+                
                 save_dict.update({
                     'candidate_draft_confidences': candidate_draft_confidences,
                     'candidate_base_confidences': candidate_base_confidences,
@@ -929,19 +948,23 @@ class CalibrationLogger:
                     'candidate_layers': candidate_layers,
                     'candidate_tree_positions': candidate_tree_positions,
                     'candidate_tree_depths': candidate_tree_depths,
-                    'candidate_parent_positions': candidate_parent_positions
+                    'candidate_parent_positions': candidate_parent_positions,
+                    # 新增字段
+                    'candidate_base_top1_tokens': candidate_base_top1_tokens,
+                    'candidate_draft_margins': candidate_draft_margins,
+                    'candidate_base_margins': candidate_base_margins,
+                    'candidate_avg_visual_attention': candidate_avg_visual_attention  # 新增：平均视觉注意力强度
                 })
             
             np_path = os.path.join(self.save_dir, f"{filename_prefix}.npz")
-            np.savez(np_path, **save_dict)
-        
-        print(f"Calibration data saved to {json_path}")
-        print(f"Total draft sessions: {len(self.draft_sessions)}")
-        print(f"Total token samples: {len(token_data)}")
-        if candidate_calibration_data:
-            print(f"Total candidate samples: {len(candidate_calibration_data)}")
-        
-        return json_path, np_path if token_data else None
+            np.savez_compressed(np_path, **save_dict)
+            
+            print(f"Calibration data saved to {json_path} and {np_path}")
+            print(f"Total tokens: {len(token_data)}, Total candidates: {len(candidate_calibration_data)}")
+            if candidate_calibration_data:
+                print(f"Average visual attention intensity: {data['summary']['avg_visual_attention_intensity']:.4f}")
+        else:
+            print("No token data to save")
 
     def calculate_oce_uce(self, confidence_scores, acceptance_labels, num_bins=20):
         """

@@ -262,6 +262,10 @@ class EaModel(nn.Module):
             log=False,
             enable_attention_logging=True,  # 新增参数，控制是否启用attention记录
             enable_candidate_calibration=False,  # 新增参数，控制是否收集candidate calibration数据
+            image_tensor=None,
+            image_sizes=None,
+            attention_masks_for_padding=None,
+            train_calibrator=False,
     ):
         
         max_length=max_length-self.ea_layer.total_tokens-10
@@ -281,29 +285,6 @@ class EaModel(nn.Module):
         except ImportError:
             CALIBRATION_LOGGING_ENABLED = False
             calibration_logger = None
-
-        # 提取图像特征信息用于calibration logging
-        image_features_for_calibration = None
-        if CALIBRATION_LOGGING_ENABLED and inputs_embeds is not None and input_ids is not None:
-            try:
-                from eagle.model.image_token_utils import calculate_image_token_positions_for_calibration
-                
-                # 计算正确的图像token位置
-                img_start_idx, img_end_idx = calculate_image_token_positions_for_calibration(
-                    input_ids=input_ids,
-                    inputs_embeds=inputs_embeds,
-                    image_features=None,
-                    batch_idx=0
-                )
-                
-                # 如果找到了图像token位置，提取对应的特征
-                if img_start_idx is not None and img_end_idx is not None:
-                    # 从inputs_embeds中提取图像特征
-                    image_features_for_calibration = [inputs_embeds[0, img_start_idx:img_end_idx]]
-                    
-            except Exception as e:
-                print(f"Warning: Failed to extract image features for calibration: {e}")
-                exit(1)
 
         padding=(torch.zeros(1,1,dtype=torch.long)-1).to(input_ids.device)
         input_ids = input_ids.clone()
@@ -329,7 +310,7 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor, inputs_embeds, enable_candidate_calibration
+            input_ids, self, past_key_values, logits_processor, inputs_embeds, enable_candidate_calibration, train_calibrator=train_calibrator
         )
         new_token = 0
 
@@ -373,19 +354,12 @@ class EaModel(nn.Module):
             
             # 记录calibration数据
             if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
-                # 记录attention权重（如果可用）
-                if attentions is not None and enable_attention_logging:
-                    # 取最后一层的attention权重
-                    last_layer_attention = attentions[-1] if isinstance(attentions, (list, tuple)) else attentions
-                    calibration_logger.log_attention_weights(last_layer_attention)
-                
-                # 注意：不要修改原有的log_acceptance调用，那是用于计算平均接受率的
                 calibration_logger.log_acceptance(
-                    draft_tokens=candidates, 
+                    draft_tokens=candidates,
                     accepted_length=accept_length,
                     best_candidate=best_candidate
                 )
-            
+
             self.acclen += accept_length
             self.accnum += 1
 
@@ -402,8 +376,12 @@ class EaModel(nn.Module):
                 self,
                 hidden_state_new,
                 sample_p,
-                inputs_embeds=inputs_embeds,                         # 将上游embeds传下去
-                enable_candidate_calibration=enable_candidate_calibration  # 按外部开关控制（若要强制记录，设为True）
+                enable_candidate_calibration=enable_candidate_calibration,
+                tree_outputs=outputs,
+                image_tensor=image_tensor,
+                image_sizes=image_sizes,
+                attention_masks_for_padding=attention_masks_for_padding,
+                train_calibrator=train_calibrator
             )
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():

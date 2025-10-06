@@ -22,6 +22,8 @@ import copy
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import math
+import re
+import string
 from typing import List, Optional, Tuple, Union
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -58,9 +60,9 @@ def _make_causal_mask(
 
     if past_key_values_length > 0:
         mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+    
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
-
-
+    
 # Copied from transformers.models.bart.modeling_bart._expand_mask
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -181,7 +183,7 @@ class Model(nn.Module):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
             image_tokens_num: Optional[list] = None,
-            std=None
+            std=None,
     ):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
@@ -322,12 +324,12 @@ class Model(nn.Module):
                 new_hidden_state = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
             hidden_states = new_hidden_state.unsqueeze(0)
-        
         else:
             inputs_embeds = inputs_embeds.to(hidden_states.device)
             hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
         all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None  # 添加注意力权重收集
         next_decoder_cache = () if use_cache else None
 
         if self.rotary_emb is not None:
@@ -375,45 +377,498 @@ class Model(nn.Module):
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
-        if use_cache:
-            return hidden_states, next_decoder_cache
+            if output_attentions:
+                # print(f"[DEBUG] Layer outputs length: {len(layer_outputs)}")
+                # print(f"[DEBUG] Layer outputs[1] type: {type(layer_outputs[1])}")
+                # if hasattr(layer_outputs[1], 'shape'):
+                #     print(f"[DEBUG] Layer outputs[1] shape: {layer_outputs[1].shape}")
+                all_self_attns += (layer_outputs[1],)  # 收集注意力权重
 
-        return hidden_states
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        # 根据不同的参数组合返回相应的值
+        if use_cache:
+            if output_attentions:
+                if output_hidden_states:
+                    return hidden_states, next_decoder_cache, all_hidden_states, all_self_attns
+                else:
+                    return hidden_states, next_decoder_cache, None, all_self_attns
+            else:
+                if output_hidden_states:
+                    return hidden_states, next_decoder_cache, all_hidden_states
+                else:
+                    return hidden_states, next_decoder_cache
+        else:
+            if output_attentions:
+                if output_hidden_states:
+                    return hidden_states, all_hidden_states, all_self_attns
+                else:
+                    return hidden_states, None, all_self_attns
+            else:
+                if output_hidden_states:
+                    return hidden_states, all_hidden_states
+                else:
+                    return hidden_states
 
     def reset_kv(self):
         self.stable_kv = None
 
+    def _collect_calibration_data_safely(self, base_model, original_context, inputs_embeds, 
+                                   context_past_key_values, topk_index, topk_p, 
+                                   layer_positions, layer_depths, layer_parents, 
+                                   layer_idx, frontier_paths=None, attentions=None,
+                                   img_start_idx=None, img_end_idx=None, train_calibrator=False):
+        """
+        安全地收集候选校准数据，避免状态污染
+        
+        Args:
+            train_calibrator: 是否为训练校准器模式
+                - True: 收集完整校准数据（包括base model预测）
+                - False: 只收集必要信息（token_category, avg_visual_attention_intensity, tree_position, draft_margin）
+        
+        Returns:
+            calibration_data: 校准数据列表，内容根据train_calibrator参数而不同
+        """
+        import copy
+        calibration_data = []
+        
+        # Token分类方法
+        def categorize_token_simple(token_id, tokenizer):
+            """
+            简化的token分类方法，按照content, func_punct, number三类分类
+            
+            Args:
+                token_id: Token ID
+                tokenizer: 分词器
+                
+            Returns:
+                str: Token category ('content', 'func_punct', 'number')
+            """
+            try:
+                # Convert token ID to text
+                token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+                
+                # Remove possible prefix spaces
+                token_text = token_text.strip()
+                
+                # Numbers (包括纯数字和小数)
+                if token_text.isdigit() or re.match(r'^\d+\.?\d*$', token_text):
+                    return 'number'
+                
+                # Punctuation and special tokens
+                if (all(c in string.punctuation for c in token_text) or 
+                    token_text.startswith('<') and token_text.endswith('>') or
+                    not token_text or token_text.isspace()):
+                    return 'func_punct'
+                
+                # Function words list (常见英文功能词)
+                function_words = {
+                    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                    'of', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during',
+                    'before', 'after', 'above', 'below', 'between', 'among', 'under', 'over',
+                    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+                    'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+                    'can', 'must', 'shall', 'ought', 'need', 'dare', 'used',
+                    'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
+                    'my', 'your', 'his', 'her', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs',
+                    'this', 'that', 'these', 'those', 'here', 'there', 'where', 'when', 'why', 'how',
+                    'what', 'which', 'who', 'whom', 'whose', 'if', 'unless', 'until', 'while', 'since',
+                    'because', 'so', 'as', 'than', 'then', 'now', 'just', 'only', 'also', 'even',
+                    'still', 'yet', 'already', 'again', 'once', 'twice', 'always', 'never', 'often',
+                    'sometimes', 'usually', 'rarely', 'hardly', 'almost', 'quite', 'very', 'too',
+                    'much', 'many', 'more', 'most', 'less', 'least', 'few', 'little', 'some', 'any',
+                    'all', 'both', 'each', 'every', 'either', 'neither', 'none', 'no', 'not'
+                }
+                
+                # Check if it's a function word
+                clean_token = token_text.lower().strip(' ')  # Remove possible subword prefix
+                if clean_token in function_words:
+                    return 'func_punct'
+                
+                # Other cases are classified as content words
+                return 'content'
+                
+            except Exception as e:
+                # print(f"⚠️ Token classification failed (ID: {token_id}): {e}")
+                return 'content'  # 默认分类为content
+        
+        # 获取tokenizer (从base_model中获取)
+        tokenizer = getattr(base_model, 'tokenizer', None)
+        if tokenizer is None:
+            # 尝试从其他可能的位置获取tokenizer
+            tokenizer = getattr(base_model, 'llm', None)
+            if tokenizer is not None:
+                tokenizer = getattr(tokenizer, 'tokenizer', None)
+        
+        # 计算平均视觉注意力强度的辅助函数
+        def calculate_avg_visual_attention(attention_weights, img_start, img_end, candidate_idx=None):
+            """
+            计算候选token对图像区域的平均注意力强度
+            
+            Args:
+                attention_weights: 注意力权重张量
+                img_start: 图像token开始位置
+                img_end: 图像token结束位置
+                candidate_idx: 候选token索引（如果为None，计算所有token的平均）
+            
+            Returns:
+                float: 平均注意力强度
+            """
+            try:
+                if attention_weights is None or img_start is None or img_end is None:
+                    return 0.0
+                
+                if img_start >= img_end:
+                    return 0.0
+                
+                # 处理不同维度的attention tensor
+                if len(attention_weights.shape) == 4:
+                    # [batch_size, num_heads, seq_len, context_len]
+                    attn = attention_weights[0]  # 取第一个batch
+                elif len(attention_weights.shape) == 3:
+                    # [num_heads, seq_len, context_len]
+                    attn = attention_weights
+                elif len(attention_weights.shape) == 2:
+                    # [seq_len, context_len]
+                    attn = attention_weights
+                else:
+                    return 0.0
+                
+                # 对多个head求平均（如果需要）
+                if len(attn.shape) == 3:  # [num_heads, seq_len, context_len]
+                    attn = attn.mean(dim=0)  # [seq_len, context_len]
+                
+                seq_len, context_len = attn.shape
+                
+                # 验证图像token索引的有效性
+                if img_start < 0 or img_end <= img_start or img_end > context_len:
+                    return 0.0
+                
+                # 如果指定了候选索引，只计算该候选的注意力
+                if candidate_idx is not None:
+                    if candidate_idx >= seq_len:
+                        return 0.0
+                    # 计算该候选token对图像区域的平均注意力
+                    img_attention = attn[candidate_idx, img_start:img_end]
+                    result = img_attention.mean().item()
+                    return result
+                else:
+                    # 计算所有候选token对图像区域的平均注意力
+                    img_attention_matrix = attn[:, img_start:img_end]  # [seq_len, img_token_len]
+                    result = img_attention_matrix.mean().item()
+                    return result
+                    
+            except Exception as e:
+                # print(f"⚠️ Visual attention calculation failed: {e}")
+                return 0.0
+        
+        # 根据train_calibrator模式决定是否需要base model预测
+        if train_calibrator:
+            # 训练模式：需要完整的校准数据，包括base model预测
+            # 保存模型的原始状态
+            original_training_state = base_model.training
+            base_model.eval()  # 确保在评估模式下
+        
+        try:
+            if layer_idx == 0:
+                # 第0层的候选校准
+                if train_calibrator:
+                    # 训练模式：需要base model预测
+                    with torch.no_grad():
+                        # 使用原始context和KV缓存进行base model预测
+                        outputs, orig, _ = base_model(
+                            inputs_embeds=inputs_embeds,
+                            past_key_values=context_past_key_values,
+                            output_orig=True
+                        )
+                        base_logits = orig[:, -1]  # [1, vocab_size]
+                        base_probs0 = torch.softmax(base_logits, dim=-1)
+                        
+                        # 计算base model的top1 token和margin
+                        base_sorted_probs, base_sorted_indices = torch.sort(base_probs0[0], descending=True)
+                        base_top1_token = base_sorted_indices[0].item()
+                        base_top1_prob = base_sorted_probs[0].item()
+                        base_top2_prob = base_sorted_probs[1].item() if len(base_sorted_probs) > 1 else 0.0
+                        base_margin = base_top1_prob - base_top2_prob
+                        
+                        # 计算draft margin
+                        draft_sorted_probs, draft_sorted_indices = torch.sort(torch.exp(topk_p[0]), descending=True)
+                        draft_top1_prob = draft_sorted_probs[0].item()
+                        draft_top2_prob = draft_sorted_probs[1].item() if len(draft_sorted_probs) > 1 else 0.0
+                        draft_margin = draft_top1_prob - draft_top2_prob
+                
+                for child_idx in range(topk_index.shape[1]):
+                    candidate_token_id = topk_index[0, child_idx].item()
+                    
+                    # 计算该候选token的平均视觉注意力强度
+                    attention_tensor = attentions[0] if isinstance(attentions, (tuple, list)) and len(attentions) > 0 else attentions
+                    avg_visual_attention = calculate_avg_visual_attention(
+                        attention_tensor, img_start_idx, img_end_idx, candidate_idx=child_idx
+                    )
+                    
+                    # 分类token
+                    token_category = categorize_token_simple(candidate_token_id, tokenizer) if tokenizer is not None else 'content'
+                    
+                    if train_calibrator:
+                        # 训练模式：收集完整数据
+                        base_prob = base_probs0[0, candidate_token_id].item()
+                        
+                        calibration_data.append({
+                            'layer': layer_idx,
+                            'position_in_layer': child_idx,
+                            'candidate_token': candidate_token_id,
+                            'draft_confidence': torch.exp(topk_p[0, child_idx]).item(),
+                            'base_confidence': base_prob,
+                            'tree_position': layer_positions[child_idx].item(),
+                            'tree_depth': layer_depths[child_idx].item(),
+                            'parent_position': layer_parents[child_idx].item(),
+                            'base_top1_token': int(candidate_token_id == base_top1_token),
+                            'draft_margin': draft_margin,
+                            'base_margin': base_margin,
+                            'avg_visual_attention_intensity': avg_visual_attention,
+                            'token_category': token_category
+                        })
+                    else:
+                        # 推理模式：只收集必要信息
+                        # 计算draft margin
+                        draft_sorted_probs, draft_sorted_indices = torch.sort(torch.exp(topk_p[0]), descending=True)
+                        draft_top1_prob = draft_sorted_probs[0].item()
+                        draft_top2_prob = draft_sorted_probs[1].item() if len(draft_sorted_probs) > 1 else 0.0
+                        draft_margin = draft_top1_prob - draft_top2_prob
+                        
+                        calibration_data.append({
+                            'candidate_token': candidate_token_id,
+                            'tree_position': layer_positions[child_idx].item(),
+                            'draft_margin': draft_margin,
+                            'avg_visual_attention_intensity': avg_visual_attention,
+                            'token_category': token_category
+                        })
+            else:
+                # 后续层的候选校准
+                if frontier_paths is None:
+                    raise ValueError("frontier_paths is required for non-zero layers")
+                
+                top_k = topk_index.shape[0]
+                
+                if train_calibrator:
+                    # 训练模式：需要base model预测
+                    # 为每个父路径计算base model预测
+                    base_predictions = {}
+                    
+                    for parent_idx in range(top_k):
+                        parent_path = frontier_paths[parent_idx]
+                        
+                        # 构建包含父路径的完整context
+                        parent_context_ids = torch.cat([
+                            original_context,
+                            torch.tensor(parent_path, device=original_context.device).unsqueeze(0)
+                        ], dim=1)
+                        
+                        # 构建对应的embeds
+                        parent_path_embeds = self.embed_tokens(torch.tensor(parent_path, device=original_context.device))
+                        parent_context_embeds = torch.cat([
+                            inputs_embeds[:, 1:],  # 去掉第一个token的embed
+                            parent_path_embeds.unsqueeze(0)
+                        ], dim=1)
+                        
+                        with torch.no_grad():
+                            # 注意：这里使用 None 作为 past_key_values，因为不同父前缀需要独立计算
+                            outputs_i, orig_i, _ = base_model(
+                                input_ids=parent_context_ids,
+                                past_key_values=None,  # 不复用KV缓存，避免状态污染
+                                output_orig=True,
+                                inputs_embeds=parent_context_embeds
+                            )
+                            base_logits_i = orig_i[:, -1]  # [1, vocab_size]
+                            base_probs_i = torch.softmax(base_logits_i, dim=-1)
+                            
+                            # 计算 base model 的 top-k 用于 margin 计算
+                            base_sorted_probs_i, base_sorted_indices_i = torch.sort(base_probs_i[0], descending=True)
+                            base_top1_token_i = base_sorted_indices_i[0].item()
+                            base_top1_prob_i = base_sorted_probs_i[0].item()
+                            base_top2_prob_i = base_sorted_probs_i[1].item() if len(base_sorted_probs_i) > 1 else 0.0
+                            base_margin_i = base_top1_prob_i - base_top2_prob_i
+                            
+                            base_predictions[parent_idx] = {
+                                'probs': base_probs_i,
+                                'top1_token': base_top1_token_i,
+                                'margin': base_margin_i
+                            }
+                
+                for parent_idx in range(top_k):
+                    if train_calibrator:
+                        # 计算 draft model 的 margin (对于当前父节点)
+                        draft_sorted_probs_i, draft_sorted_indices_i = torch.sort(torch.exp(topk_p[parent_idx]), descending=True)
+                        draft_top1_prob_i = draft_sorted_probs_i[0].item()
+                        draft_top2_prob_i = draft_sorted_probs_i[1].item() if len(draft_sorted_probs_i) > 1 else 0.0
+                        draft_margin_i = draft_top1_prob_i - draft_top2_prob_i
+                        
+                        base_pred = base_predictions[parent_idx]
+                        base_probs_i = base_pred['probs']
+                        base_top1_token_i = base_pred['top1_token']
+                        base_margin_i = base_pred['margin']
+                    
+                    for child_idx in range(topk_index.shape[1]):
+                        candidate_token_id = topk_index[parent_idx, child_idx].item()
+                        
+                        # 计算该候选token的平均视觉注意力强度
+                        candidate_attention_idx = child_idx
+                        attention_tensor = attentions[0] if isinstance(attentions, (tuple, list)) and len(attentions) > 0 else attentions
+                        avg_visual_attention = calculate_avg_visual_attention(
+                            attention_tensor, img_start_idx, img_end_idx, candidate_idx=candidate_attention_idx
+                        )
+                        
+                        # 分类token
+                        token_category = categorize_token_simple(candidate_token_id, tokenizer) if tokenizer is not None else 'content'
+                        
+                        if train_calibrator:
+                            # 训练模式：收集完整数据
+                            base_prob = base_probs_i[0, candidate_token_id].item()
+                            
+                            calibration_data.append({
+                                'layer': layer_idx,
+                                'position_in_layer': parent_idx * topk_index.shape[1] + child_idx,
+                                'candidate_token': candidate_token_id,
+                                'draft_confidence': torch.exp(topk_p[parent_idx, child_idx]).item(),
+                                'base_confidence': base_prob,
+                                'tree_position': layer_positions[parent_idx * topk_index.shape[1] + child_idx].item() if layer_positions is not None else None,
+                                'tree_depth': layer_depths[parent_idx * topk_index.shape[1] + child_idx].item() if layer_depths is not None else None,
+                                'parent_position': layer_parents[parent_idx * topk_index.shape[1] + child_idx].item() if layer_parents is not None else None,
+                                'base_top1_token': int(candidate_token_id == base_top1_token_i),
+                                'draft_margin': draft_margin_i,
+                                'base_margin': base_margin_i,
+                                'avg_visual_attention_intensity': avg_visual_attention,
+                                'token_category': token_category
+                            })
+                        else:
+                            # 推理模式：只收集必要信息
+                            # 计算 draft model 的 margin (对于当前父节点)
+                            draft_sorted_probs_i, draft_sorted_indices_i = torch.sort(torch.exp(topk_p[parent_idx]), descending=True)
+                            draft_top1_prob_i = draft_sorted_probs_i[0].item()
+                            draft_top2_prob_i = draft_sorted_probs_i[1].item() if len(draft_sorted_probs_i) > 1 else 0.0
+                            draft_margin_i = draft_top1_prob_i - draft_top2_prob_i
+                            
+                            calibration_data.append({
+                                'candidate_token': candidate_token_id,
+                                'tree_position': layer_positions[parent_idx * topk_index.shape[1] + child_idx].item() if layer_positions is not None else None,
+                                'draft_margin': draft_margin_i,
+                                'avg_visual_attention_intensity': avg_visual_attention,
+                                'token_category': token_category
+                            })
+    
+        except Exception as e:
+            print(f"[ERROR] Calibration failed for layer {layer_idx}: {str(e)}")
+            import traceback
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
+        finally:
+            # 恢复模型的原始训练状态（仅在训练模式下）
+            if train_calibrator:
+                base_model.train(original_training_state)
+        
+        return calibration_data
+
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, draft_past_key_values, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None):
-        # 按照第一次前向的延续来继续生成 candidate tree
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False):
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
-
         sample_token = input_ids[:, -1]
-
+    
         if inputs_embeds is not None:
             new_embed = self.embed_tokens(sample_token).unsqueeze(dim=0).to(inputs_embeds.device)
             inputs_embeds = torch.cat((inputs_embeds[:, 1:], new_embed), dim=1)
+        
+        input_ids = input_ids[:, 1:]
         from eagle.model.utils import temp_cache
-
+        
         scores_list = []
         parents_list = []
         ss_token = []
-
-        # 去掉开头一个token（保持原有逻辑）
-        input_ids = input_ids[:, 1:]
-        input_ids = input_ids.to(hidden_states.device)
-
+    
         len_posi = input_ids.shape[1]
-
+    
         if (input_ids == -200).any():
             len_posi += 575
-
+    
         self.reset()
-
-        # 开始新的draft session
+        # 存储candidate calibration数据
+        candidate_calibration_data = []
+        
+        # 保存原始context用于candidate calibration
+        original_context = input_ids.clone()
+        
+        # 获取图像token位置信息（用于注意力计算）
+        img_start_idx, img_end_idx = None, None
+        if CALIBRATION_LOGGING_ENABLED and enable_candidate_calibration:
+            from eagle.model.image_token_utils import calculate_image_token_positions_for_calibration
+            original_input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
+            img_start_idx, img_end_idx = calculate_image_token_positions_for_calibration(
+                input_ids=original_input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=None,
+                batch_idx=0
+            )
+            # 由于input_ids已经去掉了第一个token，需要调整位置
+            if img_start_idx is not None:
+                img_start_idx = max(0, img_start_idx - 1)
+            if img_end_idx is not None:
+                img_end_idx = max(0, img_end_idx - 1)
+            # print(f"[DEBUG] Image token positions for attention: [{img_start_idx}:{img_end_idx}]")
+        
+        if hasattr(self, "stable_kv") and self.stable_kv is not None:
+            kv_len = self.stable_kv[0][0].shape[2]
+            if -200 in input_ids:
+                kv_len -= 575
+            
+            # 在候选校准模式下获取注意力权重
+            if enable_candidate_calibration:
+                out_hidden, past_key_values, _, attentions = self(
+                    hidden_states, 
+                    input_ids=input_ids[:, kv_len:],
+                    past_key_values=self.stable_kv, 
+                    use_cache=True, 
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=True
+                )
+            else:
+                out_hidden, past_key_values = self(
+                    hidden_states, 
+                    input_ids=input_ids[:, kv_len:],
+                    past_key_values=self.stable_kv, 
+                    use_cache=True, 
+                    inputs_embeds=inputs_embeds
+                )
+                attentions = None
+        else:
+            image_tokens_num = []
+            if -200 in input_ids:
+                image_tokens_num = [576]
+            elif 151652 in input_ids:
+                image_tokens_num = [(input_ids == 151655).sum().item()]
+            
+            # 在候选校准模式下获取注意力权重
+            if enable_candidate_calibration:
+                out_hidden, past_key_values, _, attentions = self(
+                    hidden_states, 
+                    input_ids=input_ids, 
+                    use_cache=True, 
+                    inputs_embeds=inputs_embeds, 
+                    image_tokens_num=image_tokens_num,
+                    output_attentions=True
+                )
+            else:
+                out_hidden, past_key_values = self(
+                    hidden_states, 
+                    input_ids=input_ids, 
+                    use_cache=True, 
+                    inputs_embeds=inputs_embeds, 
+                    image_tokens_num=image_tokens_num
+                )
+                attentions = None
+    
+        self.stable_kv = past_key_values
         if CALIBRATION_LOGGING_ENABLED:
             logger = get_calibration_logger()
             
@@ -423,7 +878,7 @@ class Model(nn.Module):
             # 尝试从inputs_embeds推断图像token位置
             original_input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
             
-            img_start_idx, img_end_idx = calculate_image_token_positions_for_calibration(
+            img_start_idx_log, img_end_idx_log = calculate_image_token_positions_for_calibration(
                 input_ids=original_input_ids,
                 inputs_embeds=inputs_embeds,
                 image_features=None,
@@ -431,85 +886,26 @@ class Model(nn.Module):
             )
             
             # 由于input_ids已经去掉了第一个token，需要调整位置
-            if img_start_idx is not None:
-                img_start_idx = max(0, img_start_idx - 1)
-            if img_end_idx is not None:
-                img_end_idx = max(0, img_end_idx - 1)
-            
-            print("img_start_idx, img_end_idx", img_start_idx, img_end_idx)
-
-            logger.start_draft_session(img_start_idx=img_start_idx, img_end_idx=img_end_idx)
-
-        # 存储candidate calibration数据
-        candidate_calibration_data = []
-        
-        # 保存原始context用于candidate calibration
-        original_context = input_ids.clone()
-        
-        # 分离上下文KV与后续draft KV，避免变量覆盖
-        # context_past_key_values 来自 initialize_tree 的“初始化 KVCache”，用于第0层校准
-        # draft_past_key_values 来自第一次前向的返回（可能为None），用于继续生成草稿树
-        self.stable_kv = draft_past_key_values
-        
-        # 计算KV长度（兼容 KVCache / 张量）
-        def _kv_length(kv):
-            if kv is None: 
-                return 0
-            if isinstance(kv, (list, tuple)) and len(kv) > 0 and kv[0] is not None:
-                first_k = kv[0][0]
-                # KVCache 上有 current_length（CPU LongTensor），也有 shape 属性
-                if hasattr(first_k, "current_length"):
-                    try:
-                        return int(first_k.current_length.item())
-                    except Exception:
-                        return int(first_k.current_length)
-                if hasattr(first_k, "shape"):
-                    try:
-                        return int(first_k.shape[2])
-                    except Exception:
-                        return 0
-            return 0
-        
-        kv_len = _kv_length(self.stable_kv)
-        if (input_ids == -200).any():
-            kv_len = max(0, kv_len - 575)
-        
-        if kv_len > 0:
-            out_hidden, draft_past_key_values = self(
-                hidden_states,
-                input_ids=input_ids[:, kv_len:],
-                past_key_values=self.stable_kv,
-                use_cache=True,
-                inputs_embeds=inputs_embeds
-            )
-        else:
-            image_tokens_num = []
-            if (input_ids == -200).any():
-                image_tokens_num = [576]
-            elif (input_ids == 151652).any():
-                image_tokens_num = [(input_ids == 151655).sum().item()]
-            out_hidden, draft_past_key_values = self(
-                hidden_states,
-                input_ids=input_ids,
-                use_cache=True,
-                inputs_embeds=inputs_embeds,
-                image_tokens_num=image_tokens_num
-            )
-        # 用最新的draft KV作为后续层的缓存
-        self.stable_kv = draft_past_key_values
+            if img_start_idx_log is not None:
+                img_start_idx_log = max(0, img_start_idx_log - 1)
+            if img_end_idx_log is not None:
+                img_end_idx_log = max(0, img_end_idx_log - 1)
+            # print("img_start_idx, img_end_idx", img_start_idx_log, img_end_idx_log)
+            logger.start_draft_session(img_start_idx=img_start_idx_log, img_end_idx=img_end_idx_log)
+    
         # 初始化用于后续层的 KV 缓存，避免 UnboundLocalError
         past_key_values = self.stable_kv
-
+    
         last_hidden = out_hidden[:, -1]
         last_headout = head(last_hidden)
         last_p = self.logsoftmax(last_headout)
-
+    
         # --- 第 0 层 ---
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
         scores_list.append(scores[None])
-
+    
         # 记录第0层的局部分数和位置信息（保持原有）
         local_scores_list = []
         token_list = []
@@ -517,48 +913,44 @@ class Model(nn.Module):
         depth_labels_list = []
         parent_labels_list = []
         next_position_idx = 1
-
+    
         local_scores_list.append(topk_p)
         token_list.append(topk_index)
-
+    
         layer_positions = torch.arange(next_position_idx, next_position_idx + top_k, device=topk_index.device)
         layer_depths = torch.ones(top_k, device=topk_index.device)
         layer_parents = torch.zeros(top_k, device=topk_index.device)
-
+    
         position_labels_list.append(layer_positions)
         depth_labels_list.append(layer_depths)
         parent_labels_list.append(layer_parents)
         next_position_idx += top_k
-
-        # 正确初始化前沿路径
+    
         frontier_paths = [[topk_index[0, p].item()] for p in range(top_k)]
-
-        # 第0层 candidate calibration：用与 utils.py 相同的调用风格继续模型输出
+    
+        # 使用安全的候选校准函数 - 第0层
         if enable_candidate_calibration and base_model is not None:
             if context_past_key_values is None:
                 raise RuntimeError("topK_genrate: context_past_key_values 为 None；请从 initialize_tree 传入初始化的 KVCache。")
-            outputs0, orig0, _ = base_model(
-                input_ids=original_context,
-                past_key_values=context_past_key_values,  # 复用初始化的KVCache，避免 None
-                output_orig=True,
-                inputs_embeds=inputs_embeds
+        
+            layer_0_data = self._collect_calibration_data_safely(
+                base_model=base_model,
+                original_context=original_context,
+                inputs_embeds=inputs_embeds,
+                context_past_key_values=context_past_key_values,
+                topk_index=topk_index,
+                topk_p=topk_p,
+                layer_positions=layer_positions,
+                layer_depths=layer_depths,
+                layer_parents=layer_parents,
+                layer_idx=0,
+                attentions=attentions,  # 传递注意力权重
+                img_start_idx=img_start_idx,
+                img_end_idx=img_end_idx,
+                train_calibrator=train_calibrator  # 传递训练模式参数
             )
-            base_probs0 = torch.softmax(orig0[:, -1], dim=-1)
-
-            for child_idx in range(top_k):
-                candidate_token_id = topk_index[0, child_idx].item()
-                base_prob = base_probs0[0, candidate_token_id].item()
-                candidate_calibration_data.append({
-                    'layer': 0,
-                    'position_in_layer': child_idx,
-                    'candidate_token': candidate_token_id,
-                    'draft_confidence': torch.exp(topk_p[0, child_idx]).item(),
-                    'base_confidence': base_prob,
-                    'tree_position': layer_positions[child_idx].item(),
-                    'tree_depth': layer_depths[child_idx].item(),
-                    'parent_position': layer_parents[child_idx].item()
-                })
-
+            candidate_calibration_data.extend(layer_0_data)
+    
         # 设备统一到 hidden_states.device，避免受 scores 异常影响
         parents_list.append(torch.zeros(1, dtype=torch.long, device=hidden_states.device))
         ss_token.append(topk_index)
@@ -566,92 +958,43 @@ class Model(nn.Module):
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
-
+    
         # 后续层的处理
         for i in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
-
-            out_hidden, past_key_values = self(
+    
+            out_hidden, past_key_values, _, layer_attentions = self(
                 input_hidden,
                 input_ids=input_ids,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
-                use_cache=True
+                use_cache=True,
+                output_attentions=True
             )
             len_posi += 1
-
+    
             bias1 = top_k if i > 0 else 0
             bias2 = max(0, i - 1)
             bias = 1 + top_k ** 2 * bias2 + bias1
             parents = (topk_cs_index + bias)
             parents_list.append(parents)
-
+    
             last_headout = head(out_hidden[0])
             last_p = self.logsoftmax(last_headout)
-
+    
             # --- 之后每一层 ---
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
-
-            # 之后每层的 candidate calibration：对每个父的路径构造上下文并用 model(...) 计算 orig[:, -1]
-            if enable_candidate_calibration and base_model is not None:
-                for parent_idx in range(top_k):
-                    parent_path = frontier_paths[parent_idx]
-                    parent_context_ids = torch.cat([
-                        original_context,
-                        torch.tensor(parent_path, device=original_context.device).unsqueeze(0)
-                    ], dim=1)
-
-                    # 构造父路径的输入嵌入，避免 -200 等图像占位 token 触发 Embedding 越界
-                    if inputs_embeds is None:
-                        raise RuntimeError("topK_genrate: candidate calibration 需要 inputs_embeds 以支持图像上下文；当前为 None。")
-                    parent_tokens = torch.tensor(parent_path, dtype=torch.long, device=original_context.device).unsqueeze(0)
-                    parent_token_embeds = self.embed_tokens(parent_tokens).to(inputs_embeds.device)
-                    parent_context_embeds = torch.cat([inputs_embeds, parent_token_embeds], dim=1)
-
-                    outputs_i, orig_i, _ = base_model(
-                        input_ids=parent_context_ids,
-                        past_key_values=None,          # 不复用KV（不同父前缀）
-                        output_orig=True,
-                        inputs_embeds=parent_context_embeds
-                    )
-                    base_probs_i = torch.softmax(orig_i[:, -1], dim=-1)
-
-                    for child_idx in range(top_k):
-                        candidate_token_id = topk_index[parent_idx, child_idx].item()
-                        base_prob = base_probs_i[0, candidate_token_id].item()
-                        candidate_calibration_data.append({
-                            'layer': i + 1,
-                            'position_in_layer': parent_idx * top_k + child_idx,
-                            'candidate_token': candidate_token_id,
-                            'draft_confidence': torch.exp(topk_p[parent_idx, child_idx]).item(),
-                            'base_confidence': base_prob,
-                            'tree_position': next_position_idx + parent_idx * top_k + child_idx,
-                            'tree_depth': i + 2,
-                            'parent_position': (next_position_idx - top_k) + parent_idx if i == 0 else None
-                        })
-
-            cu_scores = topk_p + scores[:, None]
-            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
-            topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            scores = topk_cs_p
-
-            out_ids = topk_cs_index // top_k
-            input_hidden = out_hidden[:, out_ids]
-            input_ids = topk_index.view(-1)[topk_cs_index][None]
-
-            ss_token.append(topk_index)
-            scores_list.append(cu_scores)
-
+    
             # 记录树信息（保持原有）
             local_scores_list.append(topk_p)
             token_list.append(topk_index)
-
+    
             current_depth = i + 2
             layer_positions = torch.arange(next_position_idx, next_position_idx + top_k * top_k, device=topk_index.device)
             layer_depths = torch.full((top_k * top_k,), current_depth, device=topk_index.device)
-
+    
             parent_positions_for_layer = []
             for parent_idx in range(top_k):
                 if i == 0:
@@ -660,11 +1003,44 @@ class Model(nn.Module):
                     parent_pos = next_position_idx - top_k * top_k + parent_idx * top_k
                 parent_positions_for_layer.extend([parent_pos] * top_k)
             layer_parents = torch.tensor(parent_positions_for_layer, device=topk_index.device)
-
+    
             position_labels_list.append(layer_positions)
             depth_labels_list.append(layer_depths)
             parent_labels_list.append(layer_parents)
-
+    
+            # 使用安全的候选校准函数 - 后续层
+            if enable_candidate_calibration and base_model is not None:
+                layer_i_data = self._collect_calibration_data_safely(
+                    base_model=base_model,
+                    original_context=original_context,
+                    inputs_embeds=inputs_embeds,
+                    context_past_key_values=None,  # 后续层不使用KV缓存
+                    topk_index=topk_index,
+                    topk_p=topk_p,
+                    layer_positions=layer_positions,
+                    layer_depths=layer_depths,
+                    layer_parents=layer_parents,
+                    layer_idx=i + 1,
+                    frontier_paths=frontier_paths,
+                    attentions=layer_attentions,  # 传递注意力权重
+                    img_start_idx=img_start_idx,
+                    img_end_idx=img_end_idx,
+                    train_calibrator=train_calibrator  # 传递训练模式参数
+                )
+                candidate_calibration_data.extend(layer_i_data)
+    
+            cu_scores = topk_p + scores[:, None]
+            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
+            topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
+            scores = topk_cs_p
+    
+            out_ids = topk_cs_index // top_k
+            input_hidden = out_hidden[:, out_ids]
+            input_ids = topk_index.view(-1)[topk_cs_index][None]
+    
+            ss_token.append(topk_index)
+            scores_list.append(cu_scores)
+    
             # 更新前沿路径
             new_frontier_paths = []
             for selected_idx in topk_cs_index.tolist():
@@ -674,10 +1050,10 @@ class Model(nn.Module):
                 new_path = frontier_paths[parent_idx] + [selected_token]
                 new_frontier_paths.append(new_path)
             frontier_paths = new_frontier_paths
-
+    
             next_position_idx += top_k * top_k
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
-
+    
         # 获取所有候选的分数和token
         scores_flat = torch.cat(scores_list, dim=0).reshape(-1)        # 累计分数
         local_scores_flat = torch.cat(local_scores_list, dim=0).reshape(-1)  # 局部分数
@@ -692,7 +1068,7 @@ class Model(nn.Module):
         top_scores = torch.topk(scores_flat, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
-
+    
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
         
@@ -720,9 +1096,9 @@ class Model(nn.Module):
             # 如果启用candidate calibration，记录所有candidate的数据
             if enable_candidate_calibration and candidate_calibration_data:
                 logger.log_candidate_calibration_data(candidate_calibration_data)
-                print(f"Recorded {len(candidate_calibration_data)} candidate calibration samples")
+                print(f"[DEBUG] Recorded {len(candidate_calibration_data)} candidate calibration samples")
+                print(f"[DEBUG] Sample calibration data: {candidate_calibration_data[:3]}")
 
-                print(f"[DEBUG] {candidate_calibration_data[:10]}")
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
         mask_index[draft_parents == 0] = -1
@@ -776,6 +1152,8 @@ class Model(nn.Module):
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
+        
+        # print(f"[DEBUG] topK_genrate completed successfully")
         
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
