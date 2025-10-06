@@ -423,6 +423,8 @@ class Llava_MSD_Calibrated(lmms):
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
             try:
+                print(f"pad_token_ids {pad_token_ids}")
+                print(f"attention mask {attention_masks}")
                 inputs_embeds, attention_mask = self.model.base_model.get_inputs_embeds(input_ids,image_tensor,gen_kwargs["image_sizes"],attention_masks)
                 if self.use_msd:
                     # reset per-chunk acceptance counters
@@ -436,7 +438,10 @@ class Llava_MSD_Calibrated(lmms):
                         temperature=gen_kwargs["temperature"], 
                         max_new_tokens=512,
                         enable_attention_logging=True,
-                        enable_candidate_calibration=True
+                        enable_candidate_calibration=True,
+                        image_tensor=image_tensor,
+                        image_sizes=gen_kwargs["image_sizes"],
+                        attention_masks_for_padding=attention_masks
                     ) 
                     
                     # accumulate overall stats
@@ -542,7 +547,7 @@ class Llava_MSD_Calibrated(lmms):
             
             eval_logger.info("Calibration data saved successfully")
 
-            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(save_path="/root/Speculative_decoding/Cross_Attention")
+            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(save_path="/root/Speculative_decoding/Cross_Attention", confidence_binning="both")
 
         # Print overall average acceptance length for this evaluation
         if self.use_msd and self.total_accept_steps > 0:

@@ -19,5 +19,5 @@ python -m lmms_eval \
     --gen_kwargs temperature=0 \
     --use_msd \
     --log_samples \
-    --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/baseline.json \
-    --limit 100
+    --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/debug.json \
+    --limit 50

@@ -1,15 +1,43 @@
 Namespace(config='', model='llava_msd_calibrated', tasks='chartqa', model_args='pretrained=/root/Speculative_decoding/checkpoint/llava-v1.5-7b', num_fewshot=None, msd_model_path='/root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-7B', use_msd=True, use_talon=False, batch_size='1', max_batch_size=None, device=None, output_path='/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/baseline.json', limit=100.0, use_cache=None, cache_requests=None, check_integrity=False, write_out=False, log_samples=True, wandb_log_samples=False, log_samples_suffix='model_outputs', system_instruction=None, apply_chat_template=False, fewshot_as_multiturn=False, show_config=False, include_path=None, gen_kwargs='temperature=0', verbosity='INFO', wandb_args='', timezone='Asia/Singapore', hf_hub_log_args='', predict_only=False, seed=[0, 1234, 1234, 1234], trust_remote_code=False)
-[32m2025-10-04 04:36:24.160[0m | [1mINFO    [0m | [36m__main__[0m:[36mcli_evaluate[0m:[36m317[0m - [1mVerbosity set to INFO[0m
-[32m2025-10-04 04:36:24.160[0m | [32m[1mSUCCESS [0m | [36m__main__[0m:[36mcli_evaluate[0m:[36m321[0m - [32m[1mYou are using MSD generation[0m
-[32m2025-10-04 04:36:28.914[0m | [1mINFO    [0m | [36m__main__[0m:[36mcli_evaluate_single[0m:[36m407[0m - [1mEvaluation tracker args: {'output_path': '/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/baseline.json'}[0m
-[32m2025-10-04 04:36:28.914[0m | [33m[1mWARNING [0m | [36m__main__[0m:[36mcli_evaluate_single[0m:[36m429[0m - [33m[1m --limit SHOULD ONLY BE USED FOR TESTING.REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT.[0m
-[32m2025-10-04 04:36:28.915[0m | [1mINFO    [0m | [36m__main__[0m:[36mcli_evaluate_single[0m:[36m496[0m - [1mSelected Tasks: ['chartqa'][0m
-[32m2025-10-04 04:36:28.931[0m | [1mINFO    [0m | [36mlmms_eval.evaluator[0m:[36msimple_evaluate[0m:[36m158[0m - [1mSetting random seed to 0 | Setting numpy seed to 1234 | Setting torch manual seed to 1234[0m
-[32m2025-10-04 04:36:28.931[0m | [33m[1mWARNING [0m | [36mlmms_eval.evaluator[0m:[36msimple_evaluate[0m:[36m164[0m - [33m[1mgeneration_kwargs specified through cli, these settings will be used over set parameters in yaml tasks.[0m
+[32m2025-10-05 10:52:34.252[0m | [1mINFO    [0m | [36m__main__[0m:[36mcli_evaluate[0m:[36m317[0m - [1mVerbosity set to INFO[0m
+[32m2025-10-05 10:52:34.252[0m | [32m[1mSUCCESS [0m | [36m__main__[0m:[36mcli_evaluate[0m:[36m321[0m - [32m[1mYou are using MSD generation[0m
+[32m2025-10-05 10:52:39.117[0m | [1mINFO    [0m | [36m__main__[0m:[36mcli_evaluate_single[0m:[36m407[0m - [1mEvaluation tracker args: {'output_path': '/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/baseline.json'}[0m
+[32m2025-10-05 10:52:39.117[0m | [33m[1mWARNING [0m | [36m__main__[0m:[36mcli_evaluate_single[0m:[36m429[0m - [33m[1m --limit SHOULD ONLY BE USED FOR TESTING.REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT.[0m
+[32m2025-10-05 10:52:39.119[0m | [1mINFO    [0m | [36m__main__[0m:[36mcli_evaluate_single[0m:[36m496[0m - [1mSelected Tasks: ['chartqa'][0m
+[32m2025-10-05 10:52:39.137[0m | [1mINFO    [0m | [36mlmms_eval.evaluator[0m:[36msimple_evaluate[0m:[36m158[0m - [1mSetting random seed to 0 | Setting numpy seed to 1234 | Setting torch manual seed to 1234[0m
+[32m2025-10-05 10:52:39.137[0m | [33m[1mWARNING [0m | [36mlmms_eval.evaluator[0m:[36msimple_evaluate[0m:[36m164[0m - [33m[1mgeneration_kwargs specified through cli, these settings will be used over set parameters in yaml tasks.[0m
 CALIBRATION_LOGGING_ENABLED True
-[32m2025-10-04 04:37:44.407[0m | [1mINFO    [0m | [36mlmms_eval.models.llava_msd_calibrated[0m:[36m__init__[0m:[36m158[0m - [1mUsing 1 devices with tensor parallelism[0m
-[32m2025-10-04 04:37:44.408[0m | [1mINFO    [0m | [36mlmms_eval.evaluator_utils[0m:[36mfrom_taskdict[0m:[36m91[0m - [1mNo metadata found in task config for chartqa, using default n_shot=0[0m
-[32m2025-10-04 04:37:44.410[0m | [1mINFO    [0m | [36mlmms_eval.api.task[0m:[36mbuild_all_requests[0m:[36m425[0m - [1mBuilding contexts for chartqa on rank 0...[0m
-[32m2025-10-04 04:37:44.835[0m | [1mINFO    [0m | [36mlmms_eval.evaluator[0m:[36mevaluate[0m:[36m462[0m - [1mRunning generate_until requests[0m
+[32m2025-10-05 10:53:55.091[0m | [1mINFO    [0m | [36mlmms_eval.models.llava_msd_calibrated[0m:[36m__init__[0m:[36m158[0m - [1mUsing 1 devices with tensor parallelism[0m
+[32m2025-10-05 10:53:55.092[0m | [1mINFO    [0m | [36mlmms_eval.evaluator_utils[0m:[36mfrom_taskdict[0m:[36m91[0m - [1mNo metadata found in task config for chartqa, using default n_shot=0[0m
+[32m2025-10-05 10:53:55.094[0m | [1mINFO    [0m | [36mlmms_eval.api.task[0m:[36mbuild_all_requests[0m:[36m425[0m - [1mBuilding contexts for chartqa on rank 0...[0m
+[32m2025-10-05 10:53:55.535[0m | [1mINFO    [0m | [36mlmms_eval.evaluator[0m:[36mevaluate[0m:[36m462[0m - [1mRunning generate_until requests[0m
+[DEBUG] input_ids tensor([[    1, 29871,  3148,  1001, 29901, 29871,  -200, 29871,    13, 12542,
+          4567,   995, 29899, 29871, 29906, 29889, 29929, 29892, 29871, 29906,
+         29889, 29929, 29892, 29871, 29941, 29889, 29945, 29892, 29871, 29946,
+         29889, 29945, 29892, 29871, 29945, 29889, 29953, 29892, 29871, 29953,
+         29889, 29953, 29892, 29871, 29953, 29889, 29947, 29973,    13, 16123,
+           680,   385,  2774,   300,  3528,  1728,   738,   916,  1426,   319,
+          1799,  9047, 13566, 29901]], device='cuda:0')
 img_start_idx, img_end_idx 4 580
-[32m2025-10-04 04:37:45.711[0m | [31m[1mERROR   [0m | [36m__main__[0m:[36mcli_evaluate[0m:[36m378[0m - [31m[1mError during evaluation: 'NoneType' object is not subscriptable. Please set `--verbosity=DEBUG` to get more information.[0m
+Recorded 510 candidate calibration samples
+[DEBUG] [{'layer': 0, 'position_in_layer': 0, 'candidate_token': 29906, 'draft_confidence': 0.36181640625, 'base_confidence': 0.34765625, 'tree_position': 1, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 1, 'candidate_token': 29941, 'draft_confidence': 0.30224609375, 'base_confidence': 0.0609130859375, 'tree_position': 2, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 2, 'candidate_token': 29896, 'draft_confidence': 0.1484375, 'base_confidence': 0.076416015625, 'tree_position': 3, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 3, 'candidate_token': 29946, 'draft_confidence': 0.0599365234375, 'base_confidence': 0.03338623046875, 'tree_position': 4, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 4, 'candidate_token': 29945, 'draft_confidence': 0.034698486328125, 'base_confidence': 0.01885986328125, 'tree_position': 5, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 5, 'candidate_token': 29953, 'draft_confidence': 0.0303802490234375, 'base_confidence': 0.0213775634765625, 'tree_position': 6, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 6, 'candidate_token': 29900, 'draft_confidence': 0.027435302734375, 'base_confidence': 0.007389068603515625, 'tree_position': 7, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 7, 'candidate_token': 29955, 'draft_confidence': 0.01329803466796875, 'base_confidence': 0.01276397705078125, 'tree_position': 8, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 8, 'candidate_token': 29947, 'draft_confidence': 0.0117340087890625, 'base_confidence': 0.005535125732421875, 'tree_position': 9, 'tree_depth': 1.0, 'parent_position': 0.0}, {'layer': 0, 'position_in_layer': 9, 'candidate_token': 29929, 'draft_confidence': 0.006481170654296875, 'base_confidence': 0.00360107421875, 'tree_position': 10, 'tree_depth': 1.0, 'parent_position': 0.0}]
+[DEBUG] Before model call - dimension check:
+  full_input_ids.shape: torch.Size([1, 68])
+  full_inputs_embeds.shape: torch.Size([1, 643, 4096])
+[DEBUG] Calibration mode - topK_genrate parameters:
+  full_hidden_states.shape: torch.Size([1, 643, 4096])
+  full_input_ids.shape: torch.Size([1, 68])
+  full_input_ids content: tensor([[    1, 29871,  3148,  1001, 29901, 29871,  -200, 29871,    13, 12542,
+          4567,   995, 29899, 29871, 29906, 29889, 29929, 29892, 29871, 29906,
+         29889, 29929, 29892, 29871, 29941, 29889, 29945, 29892, 29871, 29946,
+         29889, 29945, 29892, 29871, 29945, 29889, 29953, 29892, 29871, 29953,
+         29889, 29953, 29892, 29871, 29953, 29889, 29947, 29973,    13, 16123,
+           680,   385,  2774,   300,  3528,  1728,   738,   916,  1426,   319,
+          1799,  9047, 13566, 29901, 29871, 29906, 29900,     2]],
+       device='cuda:0')
+  full_inputs_embeds.shape: torch.Size([1, 643, 4096])
+  enable_candidate_calibration: True
+  draft_past_key_values: None
+  context_past_key_values: <class 'list'> (length: 32)
+img_start_idx, img_end_idx 4 581
+[32m2025-10-05 10:54:05.902[0m | [31m[1mERROR   [0m | [36m__main__[0m:[36mcli_evaluate[0m:[36m378[0m - [31m[1mError during evaluation: Sizes of tensors must match except in dimension 1. Expected size 642 but got size 643 for tensor number 1 in the list.. Please set `--verbosity=DEBUG` to get more information.[0m
