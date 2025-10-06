@@ -1,0 +1,136 @@
+{
+  "results": {
+    "chartqa": {
+      "alias": "chartqa",
+      "relaxed_overall,none": 0.2,
+      "relaxed_overall_stderr,none": 0.2,
+      "relaxed_human_split,none": 0.2,
+      "relaxed_human_split_stderr,none": 0.2
+    }
+  },
+  "group_subtasks": {
+    "chartqa": []
+  },
+  "configs": {
+    "chartqa": {
+      "task": "chartqa",
+      "dataset_path": "/root/Speculative_decoding/datasets/ChartQA",
+      "dataset_kwargs": {
+        "token": true
+      },
+      "test_split": "test",
+      "full_docs": false,
+      "process_results_use_image": true,
+      "doc_to_visual": "<function chartqa_doc_to_visual at 0x7f895caa53a0>",
+      "doc_to_text": "<function chartqa_doc_to_text at 0x7f895caa56c0>",
+      "doc_to_target": "answer",
+      "process_results": "<function chartqa_process_results at 0x7f895caa59e0>",
+      "description": "",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "relaxed_overall",
+          "aggregation": "mean",
+          "higher_is_better": true
+        },
+        {
+          "metric": "relaxed_human_split",
+          "aggregation": "mean",
+          "higher_is_better": true
+        },
+        {
+          "metric": "relaxed_augmented_split",
+          "aggregation": "mean",
+          "higher_is_better": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "max_new_tokens": 128,
+        "temperature": 0,
+        "do_sample": false,
+        "until": [
+          "\n\n"
+        ]
+      },
+      "repeats": 1,
+      "should_decontaminate": false,
+      "metadata": [
+        {
+          "version": 0.0
+        }
+      ],
+      "lmms_eval_specific_kwargs": {
+        "default": {
+          "pre_prompt": "",
+          "post_prompt": "\nprovide answet itself without any other text"
+        },
+        "qwen_vl": {
+          "pre_prompt": "",
+          "post_prompt": " Answer:"
+        },
+        "pre_prompt": "",
+        "post_prompt": "\nprovide answet itself without any other text"
+      }
+    }
+  },
+  "versions": {
+    "chartqa": "Yaml"
+  },
+  "n-shot": {
+    "chartqa": 0
+  },
+  "higher_is_better": {
+    "chartqa": {
+      "relaxed_overall": true,
+      "relaxed_human_split": true,
+      "relaxed_augmented_split": true
+    }
+  },
+  "n-samples": {
+    "chartqa": {
+      "original": 2500,
+      "effective": 5
+    }
+  },
+  "msd_stats": {
+    "avg_accept_len": 2.6666666666666665,
+    "accept_steps": 12,
+    "accept_len": 32
+  },
+  "config": {
+    "model": "llava_msd_calibrated",
+    "model_args": "pretrained=/root/Speculative_decoding/checkpoint/llava-v1.5-7b",
+    "batch_size": "1",
+    "batch_sizes": [],
+    "device": null,
+    "use_cache": null,
+    "limit": 5.0,
+    "bootstrap_iters": 100000,
+    "gen_kwargs": {
+      "temperature": 0
+    },
+    "random_seed": 0,
+    "numpy_seed": 1234,
+    "torch_seed": 1234,
+    "fewshot_seed": 1234
+  },
+  "git_hash": "5bfc5dd",
+  "date": "20251006_144245",
+  "task_hashes": {
+    "chartqa": "e76930efaa4d5cad92c1bc511606eba4fdbbb6a8b1e9b3c0051b4773dba05afa"
+  },
+  "model_source": "llava_msd_calibrated",
+  "model_name": "/root/Speculative_decoding/checkpoint/llava-v1.5-7b",
+  "model_name_sanitized": "checkpoint__llava-v1.5-7b",
+  "system_instruction": null,
+  "system_instruction_sha": null,
+  "fewshot_as_multiturn": false,
+  "chat_template": null,
+  "chat_template_sha": null,
+  "start_time": 6603628.994864468,
+  "end_time": 6603846.816938145,
+  "total_evaluation_time_seconds": "217.8220736766234"
+}

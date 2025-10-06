@@ -441,7 +441,8 @@ class Llava_MSD_Calibrated(lmms):
                         enable_candidate_calibration=True,
                         image_tensor=image_tensor,
                         image_sizes=gen_kwargs["image_sizes"],
-                        attention_masks_for_padding=attention_masks
+                        attention_masks_for_padding=attention_masks,
+                        train_calibrator=True
                     ) 
                     
                     # accumulate overall stats
