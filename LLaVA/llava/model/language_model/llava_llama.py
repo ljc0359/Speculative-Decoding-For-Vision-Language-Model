@@ -175,9 +175,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 image_sizes=image_sizes
             )
         else:
-            if -200 in input_ids:
-                import pdb
-                pdb.set_trace()
+            # if -200 in input_ids:
+            #     import pdb
+            #     pdb.set_trace()
             inputs_embeds = self.get_model().embed_tokens(input_ids)
         return inputs_embeds, attention_mask
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None,

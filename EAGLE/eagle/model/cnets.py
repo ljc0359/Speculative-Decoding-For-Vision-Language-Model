@@ -638,8 +638,12 @@ class Model(nn.Module):
                         draft_margin = draft_top1_prob - draft_top2_prob
                         
                         calibration_data.append({
-                            'candidate_token': candidate_token_id,
+                            'layer': layer_idx,
                             'tree_position': layer_positions[child_idx].item(),
+                            'tree_depth': layer_depths[child_idx].item() if layer_depths is not None else 0,
+                            'parent_position': layer_parents[child_idx].item() if layer_parents is not None else -1,
+                            'candidate_token': candidate_token_id,
+                            'draft_confidence': torch.exp(topk_p[0, child_idx]).item(),
                             'draft_margin': draft_margin,
                             'avg_visual_attention_intensity': avg_visual_attention,
                             'token_category': token_category
@@ -750,7 +754,11 @@ class Model(nn.Module):
                             draft_margin_i = draft_top1_prob_i - draft_top2_prob_i
                             
                             calibration_data.append({
+                                'layer': layer_idx,
+                                'tree_depth': layer_depths[parent_idx * topk_index.shape[1] + child_idx].item() if layer_depths is not None else None,
+                                'parent_position': layer_parents[parent_idx * topk_index.shape[1] + child_idx].item() if layer_parents is not None else None,
                                 'candidate_token': candidate_token_id,
+                                'draft_confidence': torch.exp(topk_p[parent_idx, child_idx]).item(),
                                 'tree_position': layer_positions[parent_idx * topk_index.shape[1] + child_idx].item() if layer_positions is not None else None,
                                 'draft_margin': draft_margin_i,
                                 'avg_visual_attention_intensity': avg_visual_attention,
@@ -769,7 +777,7 @@ class Model(nn.Module):
         return calibration_data
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None):
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
@@ -950,6 +958,35 @@ class Model(nn.Module):
                 train_calibrator=train_calibrator  # 传递训练模式参数
             )
             candidate_calibration_data.extend(layer_0_data)
+
+        # 如果使用校准器，对第0层的候选进行校准
+        # print(f"[debug] use_calibrator: {use_calibrator} calibrator {calibrator} train_calibrator {train_calibrator}")
+        if use_calibrator and calibrator is not None and not train_calibrator:
+            # 从 _collect_calibration_data_safely 获取的数据中提取特征
+            
+            # 使用校准器预测置信度
+            try:
+                import pandas as pd
+                
+                # 保存原始分数用于对比和记录
+                original_scores = scores.clone()
+                
+                features_df = pd.DataFrame(layer_0_data)
+                calibrated_probs = calibrator.predict_proba(features_df)
+                
+                # 使用校准后的置信度调整分数
+                calibrated_scores = torch.tensor(calibrated_probs, device=scores.device, dtype=scores.dtype)
+                # 将校准后的置信度与原始logits结合
+                # scores = scores * 0.7 + torch.log(calibrated_scores + 1e-8) * 0.3
+                scores = torch.log(calibrated_scores + 1e-8)
+                scores_list[-1] = scores[None]
+                
+                logger.log_calibrator_scores(0, original_scores, calibrated_scores, scores, top_k)
+
+                
+                print(f"[Calibrator] Applied calibration to {top_k} candidates in layer 0")
+            except Exception as e:
+                print(f"[Calibrator] Error applying calibration in layer 0: {e}")
     
         # 设备统一到 hidden_states.device，避免受 scores 异常影响
         parents_list.append(torch.zeros(1, dtype=torch.long, device=hidden_states.device))
@@ -1028,6 +1065,32 @@ class Model(nn.Module):
                     train_calibrator=train_calibrator  # 传递训练模式参数
                 )
                 candidate_calibration_data.extend(layer_i_data)
+
+            # 如果使用校准器，对后续层的候选进行校准
+            if use_calibrator and calibrator is not None and not train_calibrator:
+                try:
+                    import pandas as pd
+
+                    # 保存原始分数用于对比和记录
+                    original_topk_p = topk_p.clone()
+
+                    features_df = pd.DataFrame(layer_i_data)
+                    calibrated_probs = calibrator.predict_proba(features_df)
+                    
+                    # 将校准后的置信度重塑为 [top_k, top_k] 形状
+                    calibrated_probs_tensor = torch.tensor(
+                        calibrated_probs, device=topk_p.device, dtype=topk_p.dtype
+                    ).view(top_k, top_k)
+                    
+                    # 使用校准后的置信度调整分数
+                    topk_p = torch.log(calibrated_probs_tensor + 1e-8)
+                    local_scores_list[-1] = topk_p
+                    
+                    logger.log_calibrator_scores(i+1, original_topk_p.view(-1), calibrated_probs_tensor.view(-1), topk_p.view(-1), top_k * top_k)
+
+                    print(f"[Calibrator] Applied calibration to {top_k * top_k} candidates in layer {i+1}")
+                except Exception as e:
+                    print(f"[Calibrator] Error applying calibration in layer {i+1}: {e}")
     
             cu_scores = topk_p + scores[:, None]
             topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
@@ -1152,9 +1215,7 @@ class Model(nn.Module):
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
-        
-        # print(f"[DEBUG] topK_genrate completed successfully")
-        
+
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
     @torch.no_grad()

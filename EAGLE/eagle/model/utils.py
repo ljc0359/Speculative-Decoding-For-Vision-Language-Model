@@ -255,7 +255,10 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, train_calibrator=False):
+def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, train_calibrator=False,
+        use_calibrator=None, calibrator=None 
+    ):
+    
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True, inputs_embeds=inputs_embeds
     )
@@ -281,7 +284,9 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_
         enable_candidate_calibration=enable_candidate_calibration,
         base_model=model,
         context_past_key_values=past_key_values,          # 初始化构建的KVCache（非None）
-        train_calibrator=train_calibrator
+        train_calibrator=train_calibrator,
+        use_calibrator=use_calibrator,
+        calibrator=calibrator
     )
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
@@ -487,7 +492,9 @@ def update_inference_inputs(
         image_tensor=None,
         image_sizes=None,
         attention_masks_for_padding=None,
-        train_calibrator=False
+        train_calibrator=False,
+        use_calibrator=False,
+        calibrator=None
 ):
     prev_input_len = input_ids.shape[1]
     if -200 in input_ids:
@@ -573,7 +580,9 @@ def update_inference_inputs(
             enable_candidate_calibration=enable_candidate_calibration,  # 开启候选校准
             base_model=model,
             context_past_key_values=model.past_key_values,   # 使用初始化的KVCache作为上下文KV
-            train_calibrator=train_calibrator
+            train_calibrator=train_calibrator,
+            use_calibrator=use_calibrator,
+            calibrator=calibrator
         )
     else:
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
@@ -585,7 +594,9 @@ def update_inference_inputs(
             enable_candidate_calibration=False,              # 关闭候选校准
             base_model=model,
             context_past_key_values=model.past_key_values,   # 使用初始化的KVCache作为上下文KV
-            train_calibrator=train_calibrator
+            train_calibrator=train_calibrator,
+            use_calibrator=False,
+            calibrator=None
         )
 
     new_token += accept_length + 1

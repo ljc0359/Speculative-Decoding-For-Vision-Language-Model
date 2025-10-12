@@ -53,7 +53,6 @@ def simple_evaluate(
     tasks: Optional[List[Union[str, dict, object]]] = None,
     msd_model=None,
     use_msd=False,
-    use_talon: bool = False,
     num_fewshot: Optional[int] = None,
     batch_size: Optional[Union[int, str]] = None,
     max_batch_size: Optional[int] = None,
@@ -182,7 +181,6 @@ def simple_evaluate(
                 "device": device,
                 "msd_model": msd_model,
                 "use_msd": use_msd,
-                "use_talon": use_talon,
             },
         )
     else:
@@ -191,7 +189,6 @@ def simple_evaluate(
             {
                 "batch_size": batch_size,
                 "device": device,
-                "use_talon": use_talon,
             },
         )
 

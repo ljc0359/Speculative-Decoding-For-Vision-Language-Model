@@ -18,10 +18,15 @@ class CalibrationLogger:
     
     def __init__(self, save_dir: str = "/root/Speculative_decoding/calibration_data"):
         self.save_dir = save_dir
+        print(f"[debug] calibration logger path: {save_dir}")
         # 改进：存储每次draft的完整信息，包括attention权重
         self.draft_sessions = []  # 存储每次draft的{confidence_scores, tokens, accepted_length, attention_weights, cross_modal_attention}
         
         # 确保保存目录存在
+
+        if save_dir == None:
+            save_dir = "/root/Speculative_decoding/calibration_data/baseline"
+            
         os.makedirs(save_dir, exist_ok=True)
         
         # 初始化统计数据
@@ -819,6 +824,86 @@ class CalibrationLogger:
         else:
             return obj
 
+    def log_calibrator_scores(self, layer_idx: int, original_scores: torch.Tensor, 
+                             calibrated_probs: torch.Tensor, calibrated_log_scores: torch.Tensor, 
+                             candidate_count: int):
+        """
+        记录校准前后的分数变化
+        
+        Args:
+            layer_idx: 层索引 (0 表示第一层，1+ 表示后续层)
+            original_scores: 校准前的原始分数
+            calibrated_probs: 校准器输出的概率值 (0-1范围)
+            calibrated_log_scores: 取对数后的校准分数
+            candidate_count: 候选数量
+        """
+        if not CALIBRATION_LOGGING_ENABLED:
+            return
+        
+        try:
+            # 转换为numpy数组便于序列化
+            original_np = original_scores.detach().cpu().numpy()
+            calibrated_probs_np = calibrated_probs.detach().cpu().numpy()
+            calibrated_log_np = calibrated_log_scores.detach().cpu().numpy()
+            
+            # 计算概率值的差异（原始分数 vs 校准概率）
+            # 注意：这里比较的是原始logits和校准后的概率值，可能需要转换
+            # 将原始分数转换为概率以便比较
+            original_probs_np = torch.softmax(original_scores, dim=-1).detach().cpu().numpy()
+            prob_diff = calibrated_probs_np - original_probs_np
+            
+            # 计算对数分数的差异
+            log_score_diff = calibrated_log_np - original_np
+            
+            # 准备记录数据
+            calibrator_data = {
+                'layer': layer_idx,
+                'candidate_count': candidate_count,
+                'original_scores': original_np.tolist(),
+                'original_probs': original_probs_np.tolist(),  # 原始分数转换的概率
+                'calibrated_probs': calibrated_probs_np.tolist(),  # 校准器输出的概率 (0-1)
+                'calibrated_log_scores': calibrated_log_np.tolist(),  # 取对数后的分数
+                'prob_differences': prob_diff.tolist(),  # 概率差异
+                'log_score_differences': log_score_diff.tolist(),  # 对数分数差异
+                'statistics': {
+                    'original_scores_mean': float(np.mean(original_np)),
+                    'original_scores_std': float(np.std(original_np)),
+                    'original_probs_mean': float(np.mean(original_probs_np)),
+                    'original_probs_std': float(np.std(original_probs_np)),
+                    'calibrated_probs_mean': float(np.mean(calibrated_probs_np)),
+                    'calibrated_probs_std': float(np.std(calibrated_probs_np)),
+                    'calibrated_log_mean': float(np.mean(calibrated_log_np)),
+                    'calibrated_log_std': float(np.std(calibrated_log_np)),
+                    'prob_diff_mean': float(np.mean(prob_diff)),
+                    'prob_diff_std': float(np.std(prob_diff)),
+                    'log_diff_mean': float(np.mean(log_score_diff)),
+                    'log_diff_std': float(np.std(log_score_diff)),
+                    'max_prob_increase': float(np.max(prob_diff)),
+                    'max_prob_decrease': float(np.min(prob_diff))
+                }
+            }
+            
+            # 读取现有数据或创建新文件
+            calibrator_file = os.path.join(self.save_dir, "calibrator_scores.json")
+            
+            if os.path.exists(calibrator_file):
+                with open(calibrator_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+            else:
+                existing_data = {'calibrator_score_changes': []}
+            
+            # 添加新数据
+            existing_data['calibrator_score_changes'].append(calibrator_data)
+            
+            # 保存到文件
+            with open(calibrator_file, 'w', encoding='utf-8') as f:
+                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"[CalibrationLogger] Logged calibrator scores for layer {layer_idx} to {calibrator_file}")
+            
+        except Exception as e:
+            print(f"[CalibrationLogger] Error logging calibrator scores: {e}")
+
     def get_candidate_calibration_data(self):
         """
         提取所有candidate calibration数据
@@ -884,8 +969,8 @@ class CalibrationLogger:
                 'avg_confidence': float(np.mean([item.get('path_confidence', item.get('confidence', 0.0)) for item in token_data])) if token_data else 0,
                 'avg_acceptance_rate': float(np.mean([item['is_accepted'] for item in token_data])) if token_data else 0,
                 'avg_cross_modal_attention': float(np.mean([item['cross_modal_attention'] for item in token_data])) if token_data else 0,
-                'avg_draft_candidate_confidence': float(np.mean([item['draft_confidence'] for item in candidate_calibration_data])) if candidate_calibration_data else 0,
-                'avg_base_candidate_confidence': float(np.mean([item['base_confidence'] for item in candidate_calibration_data])) if candidate_calibration_data else 0,
+                'avg_draft_candidate_confidence': float(np.mean([item.get('draft_confidence', 0.0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
+                'avg_base_candidate_confidence': float(np.mean([item.get('base_confidence', 0.0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
                 'avg_base_top1_match_rate': float(np.mean([item.get('base_top1_token', 0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
                 'avg_draft_margin': float(np.mean([item.get('draft_margin', 0.0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
                 'avg_base_margin': float(np.mean([item.get('base_margin', 0.0) for item in candidate_calibration_data])) if candidate_calibration_data else 0,
@@ -926,9 +1011,9 @@ class CalibrationLogger:
             }
             
             # 如果有candidate calibration数据，也保存到numpy文件
-            if candidate_calibration_data:
-                candidate_draft_confidences = np.array([item['draft_confidence'] for item in candidate_calibration_data])
-                candidate_base_confidences = np.array([item['base_confidence'] for item in candidate_calibration_data])
+            if candidate_calibration_data:  
+                candidate_draft_confidences = np.array([item.get('draft_confidence', 0.0) for item in candidate_calibration_data])  
+                candidate_base_confidences = np.array([item.get('base_confidence', 0.0) for item in candidate_calibration_data])
                 candidate_tokens = np.array([item['candidate_token'] for item in candidate_calibration_data])
                 candidate_layers = np.array([item['layer'] for item in candidate_calibration_data])
                 candidate_tree_positions = np.array([item['tree_position'] for item in candidate_calibration_data])
@@ -953,7 +1038,17 @@ class CalibrationLogger:
                     'candidate_base_top1_tokens': candidate_base_top1_tokens,
                     'candidate_draft_margins': candidate_draft_margins,
                     'candidate_base_margins': candidate_base_margins,
-                    'candidate_avg_visual_attention': candidate_avg_visual_attention  # 新增：平均视觉注意力强度
+                    'candidate_avg_visual_attention': candidate_avg_visual_attention,  # 新增：平均视觉注意力强度
+                    
+                    # 添加校准器训练所需的字段
+                    'soft_labels': candidate_base_confidences,  # soft_labels = base_confidence
+                    'hard_labels': candidate_base_top1_tokens,  # hard_labels = base_top1_token (0或1)
+                    
+                    # 添加校准器所需的特征字段
+                    'tree_position': candidate_tree_positions,
+                    'draft_margin': candidate_draft_margins,
+                    'avg_visual_attention_intensity': candidate_avg_visual_attention,
+                    'token_category': np.array([item.get('token_category', 'content') for item in candidate_calibration_data])
                 })
             
             np_path = os.path.join(self.save_dir, f"{filename_prefix}.npz")
@@ -1328,11 +1423,11 @@ class CalibrationLogger:
 # 全局logger实例
 _global_logger = None
 
-def get_calibration_logger():
+def get_calibration_logger(save_dir=None):
     """获取全局的校准日志器实例"""
     global _global_logger
     if _global_logger is None:
-        _global_logger = CalibrationLogger()
+        _global_logger = CalibrationLogger(save_dir)
     return _global_logger
 
 def reset_calibration_logger():
@@ -1342,4 +1437,4 @@ def reset_calibration_logger():
         _global_logger.reset_stats()
 
 # 创建全局实例
-calibration_logger = get_calibration_logger()
+# calibration_logger = get_calibration_logger()

@@ -266,8 +266,11 @@ class EaModel(nn.Module):
             image_sizes=None,
             attention_masks_for_padding=None,
             train_calibrator=False,
+            use_calibrator=False,  # 新增参数，控制是否使用校准器
+            calibrator=None,  # 新增参数，传递校准器对象
     ):
         
+        print(f"[msdgenerate] use_calibrator {use_calibrator} calibrator {calibrator}")
         max_length=max_length-self.ea_layer.total_tokens-10
 
         if temperature > 1e-5:
@@ -285,6 +288,13 @@ class EaModel(nn.Module):
         except ImportError:
             CALIBRATION_LOGGING_ENABLED = False
             calibration_logger = None
+
+        # 将校准器存储到模型中，供后续使用
+        if use_calibrator and calibrator is not None:
+            self.calibrator = calibrator
+            print(f"Using calibrator for inference: {type(calibrator).__name__}")
+        else:
+            self.calibrator = None
 
         padding=(torch.zeros(1,1,dtype=torch.long)-1).to(input_ids.device)
         input_ids = input_ids.clone()
@@ -310,8 +320,10 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor, inputs_embeds, enable_candidate_calibration, train_calibrator=train_calibrator
+            input_ids, self, past_key_values, logits_processor, inputs_embeds, enable_candidate_calibration, train_calibrator=train_calibrator,
+            use_calibrator=use_calibrator, calibrator=calibrator
         )
+
         new_token = 0
 
         for idx in range(max_length):
@@ -381,7 +393,9 @@ class EaModel(nn.Module):
                 image_tensor=image_tensor,
                 image_sizes=image_sizes,
                 attention_masks_for_padding=attention_masks_for_padding,
-                train_calibrator=train_calibrator
+                train_calibrator=train_calibrator,
+                use_calibrator=use_calibrator,
+                calibrator=calibrator
             )
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():

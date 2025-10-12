@@ -112,12 +112,6 @@ def parse_eval_args() -> argparse.Namespace:
         help="If True, use msd for inference",
     )
     parser.add_argument(
-        "--use_talon",
-        action="store_true",
-        default=False,
-        help="If True, use cnets_talon as draft network instead of default cnets",
-    )
-    parser.add_argument(
         "--batch_size",
         "-b",
         type=str,
@@ -502,7 +496,6 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         model_args=args.model_args,
         msd_model=args.msd_model_path,
         use_msd=args.use_msd,
-        use_talon=args.use_talon,
         tasks=task_names,
         num_fewshot=args.num_fewshot,
         batch_size=args.batch_size,

@@ -21,10 +21,8 @@ import warnings
 
 from eagle.model.ea_model import EaModel
 from eagle.model.utils import temp_cache
-
-# 添加calibration logger导入
 try:
-    from eagle.model.calibration_logger import calibration_logger, CALIBRATION_LOGGING_ENABLED
+    from eagle.model.calibration_logger import get_calibration_logger, CALIBRATION_LOGGING_ENABLED
     print("CALIBRATION_LOGGING_ENABLED True")
 except ImportError as e:
     print(f"CALIBRATION_LOGGING_ENABLED False: {e}")
@@ -67,7 +65,6 @@ class Llava_MSD_Calibrated(lmms):
         batch_size: Optional[Union[int, str]] = 1,
         msd_model: str = None,
         use_msd: bool = False,
-        use_talon: bool = False,
         model_name=None,
         attn_implementation=best_fit_attn_implementation,
         device_map="auto",
@@ -111,16 +108,8 @@ class Llava_MSD_Calibrated(lmms):
                 torch_dtype=torch.float16,
                 low_cpu_mem_usage=True,
                 device_map="auto",
-                total_token=-1,
-                use_talon=use_talon
+                total_token=-1
         )
-        # try:
-        #     # Try to load the model with the multimodal argument
-        #     self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, None, model_name, device_map=self.device_map, **llava_model_args)
-        # except TypeError:
-        #     # for older versions of LLaVA that don't have multimodal argument
-        #     llava_model_args.pop("multimodal", None)
-        #     self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, None, model_name, device_map=self.device_map, **llava_model_args)
 
         self._config = self._model.base_model.config
         self.model.eval()
@@ -312,6 +301,76 @@ class Llava_MSD_Calibrated(lmms):
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
+        
+        # 数据分割配置
+        total_samples = len(requests)
+        train_ratio = 0.4  # 40% 用于训练
+        val_ratio = 0    # 10% 用于验证
+        test_ratio = 0.6   # 50% 用于测试
+        
+        train_end = int(total_samples * train_ratio)
+        val_end = int(total_samples * (train_ratio + val_ratio))
+        
+        print(f"Data split: Train={train_end}, Val={val_end-train_end}, Test={total_samples-val_end}")
+        print(f"Total samples: {total_samples}")
+
+        # 动态创建结果保存路径
+        # 从requests中获取任务名称
+        task_name = requests[0].task_name if requests else "unknown"
+        train_count = train_end
+        val_count = val_end - train_end
+        test_count = total_samples - val_end
+        
+        # 构建动态路径
+        result_folder_name = f"{task_name}_train_{train_count}_val_{val_count}_test_{test_count}_total_{total_samples}"
+        base_calibration_path = f"/root/Speculative_decoding/calibration_data/{result_folder_name}"
+        cross_attention_path = base_calibration_path
+
+        calibration_logger = get_calibration_logger(base_calibration_path)
+
+        # 确保目录存在
+        os.makedirs(base_calibration_path, exist_ok=True)
+        os.makedirs(cross_attention_path, exist_ok=True)
+        
+        print(f"Results will be saved to: {base_calibration_path}")
+
+        # 检查是否已存在训练好的校准器
+        calibrator_dir = os.path.join(base_calibration_path, "calibrators")
+        isotonic_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
+        monotonic_path = os.path.join(calibrator_dir, "monotonic_network_calibrator.pkl")
+        
+        calibrator_trained = False
+        trained_calibrators = {}
+        
+        if os.path.exists(isotonic_path) and os.path.exists(monotonic_path):
+            print("\n" + "="*50)
+            print("Found existing calibrators! Loading pre-trained calibrators...")
+            print(f"  - Isotonic: {isotonic_path}")
+            print(f"  - Monotonic: {monotonic_path}")
+            print("="*50)
+            
+            try:
+                trained_calibrators = self._load_existing_calibrators(isotonic_path, monotonic_path)
+                if trained_calibrators:
+                    calibrator_trained = True
+                    
+                    # 将训练好的校准器传递给模型
+                    if 'isotonic' in trained_calibrators:
+                        self.model.calibrator = trained_calibrators['isotonic']
+                        print("Pre-trained calibrator loaded into model for inference.")
+                    
+                    print("Skipping training phase - proceeding directly to testing!")
+                    print("="*50 + "\n")
+                    
+                    # 直接跳到测试阶段，重新设置数据分割
+                    train_end = 0  # 跳过训练阶段
+                    val_end = 0    # 跳过验证阶段
+                    print(f"Modified data split: Train=0, Val=0, Test={total_samples} (using pre-trained calibrators)")
+                else:
+                    print("Failed to load existing calibrators, will proceed with training.")
+            except Exception as e:
+                print(f"Error loading existing calibrators: {e}")
+                print("Will proceed with training new calibrators.")
 
         def _collate(x):
             # the negative sign on len(toks) sorts descending - this has a few advantages:
@@ -331,25 +390,78 @@ class Llava_MSD_Calibrated(lmms):
         num_iters = len(requests) // self.batch_size if len(requests) % self.batch_size == 0 else len(requests) // self.batch_size + 1
         pbar = tqdm(total=num_iters, disable=(self.rank != 0), desc="Model Responding")
         
+        chunks_list = list(chunks)
 
-        for chunk in chunks:
-            # inputs = []
-            # outputs = []
-            # accept_reject = []
-            # reject = []
-            # from eagle.model.utils import temp_cache
-            # temp_cache.sample_accept_token = []
-            # temp_cache.sample_reject_token = []
+        # 校准器训练相关变量 - 移除重复定义
+        # calibrator_trained = False
+        # trained_calibrators = {}
+        
+        for chunk_idx, chunk in enumerate(chunks_list):
+            # 确定当前chunk属于哪个数据集
+            current_sample_idx = chunk_idx  # 假设batch_size=1
+            
+            if current_sample_idx < train_end:
+                data_phase = "train"
+                train_calibrator_flag = True
+                use_calibrator = False  # 训练阶段不使用校准器
+            elif current_sample_idx < val_end:
+                data_phase = "val"
+                train_calibrator_flag = False
+                use_calibrator = calibrator_trained  # 验证阶段使用已训练的校准器
+            else:
+                data_phase = "test"
+                train_calibrator_flag = False
+                use_calibrator = calibrator_trained  # 测试阶段使用已训练的校准器
+            
+            # 在训练阶段结束后训练校准器
+            if current_sample_idx == train_end and not calibrator_trained:
+                print("\n" + "="*50)
+                print("Training phase completed. Starting calibrator training...")
+                print("="*50)
+                
+                # 保存训练阶段的校准数据
+                if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
+                    calibration_logger.save_data("training_calibration_data")
+                    print("Training calibration data saved.")
+                
+                # 训练校准器：调用 EAGLE 的 calibrator_training
+                try:
+                    # import sys, os
+                    # eagle_path = "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/EAGLE"
+                    # if eagle_path not in sys.path:
+                    #     sys.path.append(eagle_path)
+                    from eagle.model.calibrators import calibrator_training
+
+                    calibrator_dir = os.path.join(base_calibration_path, "calibrators")
+                    os.makedirs(calibrator_dir, exist_ok=True)
+                    json_path = os.path.join(base_calibration_path, "non_calibrator", "training_calibration_data.json")
+
+                    print(f"Starting calibrator_training with json: {json_path}")
+                    iso_cal, mono_cal = calibrator_training(calibrator_dir, json_path)
+                    trained_calibrators = {'isotonic': iso_cal, 'monotonic': mono_cal}
+                    calibrator_trained = True
+                    print("Calibrator training completed and models saved.")
+                except Exception as e:
+                    print(f"Error training calibrators via EAGLE.calibrator_training: {e}")
+                    trained_calibrators = {}
+                    calibrator_trained = False
+                
+                # 将训练好的校准器传递给模型
+                if trained_calibrators and 'isotonic' in trained_calibrators:
+                    # 选择使用分组等渗校准器作为主要校准器
+                    self.model.calibrator = trained_calibrators['isotonic']
+                    print("Calibrator loaded into model for inference.")
+                
+                print("Calibrator training completed!")
+                print("="*50 + "\n")
+            
+            print(f"Processing chunk {chunk_idx + 1}/{len(chunks_list)} - Phase: {data_phase} - Use Calibrator: {use_calibrator}")
+            
             contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
             task = task[0]
             split = split[0]
             batched_visuals = [doc_to_visual[0](self.task_dict[task][split][ids]) for ids in doc_id]  # [B, N]
             flattened_visuals = self.flatten(batched_visuals)  # [B*N]
-            # we assume all gen kwargs in the batch are the same
-            # this is safe to assume because the `grouper` object ensures it.
-            # image_path = "/data/llx/code/spd_7b/result/wrong_token/image/saved_image_2a04f4a2-fef6-46f5-8856-56af0eb065cc.jpg"
-            # with open(image_path, "rb") as img_file:
-            #     flattened_visuals[0] = img_file.read()
             gen_kwargs = all_gen_kwargs[0]
 
             # Set default values for until and max_new_tokens
@@ -376,8 +488,6 @@ class Llava_MSD_Calibrated(lmms):
                     image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
             else:
                 image_tensor = None
-
-            # prompts_input = contexts[0]
 
             question_input = []
 
@@ -423,8 +533,6 @@ class Llava_MSD_Calibrated(lmms):
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
             try:
-                print(f"pad_token_ids {pad_token_ids}")
-                print(f"attention mask {attention_masks}")
                 inputs_embeds, attention_mask = self.model.base_model.get_inputs_embeds(input_ids,image_tensor,gen_kwargs["image_sizes"],attention_masks)
                 if self.use_msd:
                     # reset per-chunk acceptance counters
@@ -442,7 +550,10 @@ class Llava_MSD_Calibrated(lmms):
                         image_tensor=image_tensor,
                         image_sizes=gen_kwargs["image_sizes"],
                         attention_masks_for_padding=attention_masks,
-                        train_calibrator=True
+                        train_calibrator=train_calibrator_flag,
+                        use_calibrator=use_calibrator,  # 新增参数，控制是否使用校准器
+                        # use_calibrator=False,
+                        calibrator=trained_calibrators.get('isotonic', None) if use_calibrator else None  # 传递校准器
                     ) 
                     
                     # accumulate overall stats
@@ -452,85 +563,31 @@ class Llava_MSD_Calibrated(lmms):
                     output_ids = self.model.naivegenerate(input_ids, inputs_embeds=inputs_embeds, temperature=gen_kwargs["temperature"], max_new_tokens=512)
                 cont = output_ids[:,input_ids.shape[1]:]
 
-                # torch.cuda.synchronize()
-                # end_time = time.time()
-                
-                # print(f"Time: {end_time - start_time}")
-
                 self.output_len += cont[0].shape[0]
                 self.output_num += 1
                 temp_cache.total_out_num += cont[0].shape[0]
                 temp_cache.total_in_num += input_ids.shape[1]
-                # print(self.output_len / self.output_num)
                 text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
-                # choose instance of veagle
-                # accept_tensor = torch.tensor(temp_cache.sample_accept_token, dtype=torch.float32).cuda()
-                # # wrong_tensor = torch.tensor(temp_cache.sample_reject_token, dtype=torch.float32).cuda()
-                # decoded_tokens = self.tokenizer.decode(accept_tensor, skip_special_tokens=True)
-                # # wrong_tokens = self.tokenizer.decode(wrong_tensor, skip_special_tokens=True)
-                # accept_reject.append(decoded_tokens)
-                # # reject.append(wrong_tokens)
-                # # outputs.append(text_outputs)
-                # import json
-                # # import os
-                # import os
-                # import uuid
-                # image = flattened_visuals[0]
-
-                # save_dir = "/data/llx/code/spd_7b/result/wrong_token/image"
-                # # Generate a unique filename using UUID
-                # image_filename = f"saved_image_{uuid.uuid4()}.jpg"
-                # image_path = os.path.join(save_dir, image_filename)
-
-                # # Save the image
                 
-
-                # os.makedirs(os.path.dirname(temp_cache.answer_file), exist_ok=True)
-                # if 150 < len(decoded_tokens) and  len(decoded_tokens) < 250:
-                #     image.save(image_path)
-                #     with open(os.path.expanduser(temp_cache.answer_file), "a") as fout:
-                #         ans_json = {
-                #             "accept_reject":accept_reject,
-                #             "prompt":inputs,
-                #             # "outputs":outputs,
-                #             "image_path":image_path
-                #         }
-                #         fout.write(json.dumps(ans_json) + "\n")
-                # print(text_outputs)
             except Exception as e:
                 raise e
                 eval_logger.error(f"Error {e} in generating")
                 cont = ""
                 text_outputs = [""]
 
-            # cont_toks_list = cont.tolist()
-            # for cont_toks, context in zip(cont_toks_list, contexts):
-            # discard context + left-padding toks if using causal decoder-only LMM
-            # if self.truncate_context:
-            #     cont_toks = cont_toks[input_ids.shape[1] :]
-            # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
-            # if self.truncate_context:
-            #     for term in until:
-            #         if len(term) > 0:
-            #             # ignore '' separator,
-            #             # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
-            #             text_outputs = text_outputs.split(term)[0]
             res.extend(text_outputs)
             self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
             pbar.update(1)
-            # reorder this group of results back to original unsorted form
         
         res = re_ords.get_original(res)
 
         pbar.close()
         
-        # 在评估结束时保存calibration数据
         if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
-            # 保存所有收集的calibration数据
-            calibration_logger.save_data("final_calibration_data")
+            calibration_logger.save_data("test_calibration_data")
             
-            # 计算ECE并绘制图表
-            figure_save_path = "/root/Speculative_decoding/calibration_data/baseline_ece_bin_20.png"
+            # 计算ECE并绘制图表 - 使用测试数据
+            figure_save_path = os.path.join(base_calibration_path, "test_ece_bin_20.png")
             os.makedirs(os.path.dirname(figure_save_path), exist_ok=True)
             
             stats = calibration_logger.get_calibration_stats(
@@ -540,25 +597,90 @@ class Llava_MSD_Calibrated(lmms):
             )
             
             if stats:
-                eval_logger.info(f"Calibration analysis completed:")
+                eval_logger.info(f"Test phase calibration analysis completed:")
                 eval_logger.info(f"  - ECE: {stats.get('ece', 'N/A'):.4f}")
                 eval_logger.info(f"  - Overall acceptance rate: {stats.get('overall_acceptance_rate', 'N/A'):.4f}")
                 eval_logger.info(f"  - Total samples: {stats.get('total_samples', 'N/A')}")
                 eval_logger.info(f"  - Figure saved to: {figure_save_path}")
             
-            eval_logger.info("Calibration data saved successfully")
-
-            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(save_path="/root/Speculative_decoding/Cross_Attention", confidence_binning="both")
-
-        # Print overall average acceptance length for this evaluation
-        if self.use_msd and self.total_accept_steps > 0:
-            avg_tau = float(self.total_accept_len) / float(self.total_accept_steps)
-            print(f"[llava_msd] Average acceptance length over run: {avg_tau:.2f} (steps={self.total_accept_steps})", flush=True)
-            try:
-                eval_logger.info(f"Average acceptance length over run: {avg_tau:.2f} (steps={self.total_accept_steps})")
-            except Exception:
-                pass
+            eval_logger.info("Test calibration data saved successfully")
+            
+            # 生成跨模态注意力分析图表
+            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(
+                save_path=cross_attention_path, 
+                confidence_binning="both"
+            )
+            
         return res
     
     def generate_until_multi_round(self, requests) -> List[str]:
         raise NotImplementedError("TODO: Implement multi-round generation for LLaVA_eagle")
+
+    def _load_existing_calibrators(self, isotonic_path, monotonic_path):
+        """加载已存在的校准器"""
+        import sys
+        import pickle
+
+        # 添加EAGLE模块路径
+        eagle_path = "/root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/EAGLE"
+        if eagle_path not in sys.path:
+            sys.path.append(eagle_path)
+
+        # 导入校准器类与嵌套的单调网络模型类
+        from eagle.model.calibrators import (
+            GroupedIsotonicCalibrator,
+            MonotonicNetworkCalibrator,
+            MonotonicMLP,
+        )
+
+        # 自定义Unpickler以兼容历史pickle中的命名空间
+        class _CalibratorUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                # 统一映射三类对象（包含嵌套的MonotonicMLP）
+                mapping = {
+                    "GroupedIsotonicCalibrator": GroupedIsotonicCalibrator,
+                    "MonotonicNetworkCalibrator": MonotonicNetworkCalibrator,
+                    "MonotonicMLP": MonotonicMLP,
+                }
+                # 旧命名空间兼容（lmms_eval.__main__ / __main__）
+                if name in mapping and module in (
+                    "lmms_eval.__main__",
+                    "__main__",
+                    "eagle.model.calibrators",
+                ):
+                    return mapping[name]
+                # 名称匹配也直接返回
+                if name in mapping:
+                    return mapping[name]
+                return super().find_class(module, name)
+
+        trained_calibrators = {}
+
+        # 加载分组等渗校准器
+        try:
+            print(f"Loading isotonic calibrator from: {isotonic_path}")
+            with open(isotonic_path, "rb") as f:
+                isotonic_cal = _CalibratorUnpickler(f).load()
+            if not isinstance(isotonic_cal, GroupedIsotonicCalibrator):
+                isotonic_cal = GroupedIsotonicCalibrator.load(isotonic_path)
+            trained_calibrators["isotonic"] = isotonic_cal
+            print("✓ Isotonic calibrator loaded successfully")
+        except Exception as e:
+            print(f"Error loading isotonic calibrator: {e}")
+
+        # 加载单调网络校准器
+        try:
+            print(f"Loading monotonic calibrator from: {monotonic_path}")
+            with open(monotonic_path, "rb") as f:
+                monotonic_cal = _CalibratorUnpickler(f).load()
+            if not isinstance(monotonic_cal, MonotonicNetworkCalibrator):
+                monotonic_cal = MonotonicNetworkCalibrator.load(monotonic_path)
+            trained_calibrators["monotonic"] = monotonic_cal
+            print("✓ Monotonic calibrator loaded successfully")
+        except Exception as e:
+            print(f"Error loading monotonic calibrator: {e}")
+
+        if trained_calibrators:
+            print(f"Successfully loaded {len(trained_calibrators)} calibrators")
+        return trained_calibrators
+
