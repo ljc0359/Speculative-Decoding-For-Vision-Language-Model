@@ -392,6 +392,7 @@ class Task(abc.ABC):
         fewshot_as_multiturn: bool = False,
         chat_template: Optional[Callable] = None,
         tokenizer_name: str = "",
+        bottom: Optional[int] = None,  # 新增参数
     ) -> None:
         """Build a set of Instances for a task, and store them in task.instances"""
         if self.has_test_docs():
@@ -415,9 +416,13 @@ class Task(abc.ABC):
         cached_instances = load_from_cache(file_name=cache_key)
 
         if cache_requests and cached_instances and not rewrite_requests_cache:
-            cached_instances = cached_instances[:limit]
+            # 根据 bottom 或 limit 选择缓存切片
+            if bottom is not None:
+                sliced_cached = cached_instances[-int(bottom) :]
+            else:
+                sliced_cached = cached_instances[:limit]
 
-            flattened_instances = [instance for instance_group in cached_instances for instance in instance_group]
+            flattened_instances = [instance for instance_group in sliced_cached for instance in instance_group]
 
             self._instances = flattened_instances
             return
@@ -427,10 +432,12 @@ class Task(abc.ABC):
         instances = []
 
         # process all documents when caching is specified for simplicity
-        if cache_requests and (not cached_instances or rewrite_requests_cache) and limit is not None:
+        if cache_requests and (not cached_instances or rewrite_requests_cache) and limit is not None and bottom is None:
+            # 仅在 top 限制时取消限制，以便完整缓存
             limit = None
 
-        doc_id_docs = list(self.doc_iterator(rank=rank, limit=limit, world_size=world_size))
+        # 使用 bottom 的 doc 迭代器
+        doc_id_docs = list(self.doc_iterator(rank=rank, limit=og_limit, world_size=world_size, bottom=bottom))
 
         num_docs = len(doc_id_docs)
 
@@ -461,8 +468,10 @@ class Task(abc.ABC):
             instances.append(inst)
 
         # now flatten, this is to allow slicing to work with pickles
-
-        sliced_instances = instances[:og_limit]
+        if bottom is not None:
+            sliced_instances = instances  # bottom 已在 doc_iterator 层面处理
+        else:
+            sliced_instances = instances[:og_limit]
 
         flattened_instances = [instance for instance_group in sliced_instances for instance in instance_group]
 
@@ -657,10 +666,20 @@ class Task(abc.ABC):
         else:
             raise ValueError(f"Task dataset (path={self.DATASET_PATH}, name={self.DATASET_NAME}) must have valid or test docs!")
 
-    def doc_iterator(self, *, rank: int = 0, limit: Union[int, None] = None, world_size: int = 1) -> Iterator[Tuple[int, Any]]:
+    def doc_iterator(self, *, rank: int = 0, limit: Union[int, None] = None, world_size: int = 1, bottom: Union[int, None] = None) -> Iterator[Tuple[int, Any]]:
         limit = int(limit) if limit else None
+        # Prepare enumerated docs and apply bottom slicing if requested
+        enumerated_docs = list(enumerate(self.eval_docs))
+        if bottom is not None:
+            try:
+                b = int(bottom)
+            except (TypeError, ValueError):
+                b = None
+            if b is not None and b > 0:
+                start = max(0, len(enumerated_docs) - b)
+                enumerated_docs = enumerated_docs[start:]
         doc_iterator = utils.create_iterator(
-            enumerate(self.eval_docs),
+            enumerated_docs,
             rank=int(rank),
             limit=limit,
             world_size=int(world_size),

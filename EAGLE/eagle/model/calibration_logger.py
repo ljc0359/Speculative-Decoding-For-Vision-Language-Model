@@ -241,7 +241,7 @@ class CalibrationLogger:
             self.current_session['candidate_calibration_data'] = []
         
         self.current_session['candidate_calibration_data'].extend(calibration_data)
-        print(f"[CALIBRATION] Logged {len(calibration_data)} candidate calibration data points")
+        # print(f"[CALIBRATION] Logged {len(calibration_data)} candidate calibration data points")
     
     def log_acceptance(self, accepted_length: int, draft_tokens=None, best_candidate=None):
         """记录acceptance结果"""
@@ -865,41 +865,15 @@ class CalibrationLogger:
                 'calibrated_log_scores': calibrated_log_np.tolist(),  # 取对数后的分数
                 'prob_differences': prob_diff.tolist(),  # 概率差异
                 'log_score_differences': log_score_diff.tolist(),  # 对数分数差异
-                'statistics': {
-                    'original_scores_mean': float(np.mean(original_np)),
-                    'original_scores_std': float(np.std(original_np)),
-                    'original_probs_mean': float(np.mean(original_probs_np)),
-                    'original_probs_std': float(np.std(original_probs_np)),
-                    'calibrated_probs_mean': float(np.mean(calibrated_probs_np)),
-                    'calibrated_probs_std': float(np.std(calibrated_probs_np)),
-                    'calibrated_log_mean': float(np.mean(calibrated_log_np)),
-                    'calibrated_log_std': float(np.std(calibrated_log_np)),
-                    'prob_diff_mean': float(np.mean(prob_diff)),
-                    'prob_diff_std': float(np.std(prob_diff)),
-                    'log_diff_mean': float(np.mean(log_score_diff)),
-                    'log_diff_std': float(np.std(log_score_diff)),
-                    'max_prob_increase': float(np.max(prob_diff)),
-                    'max_prob_decrease': float(np.min(prob_diff))
-                }
             }
             
-            # 读取现有数据或创建新文件
+            # 直接覆盖写入（不再读取已有数据）
             calibrator_file = os.path.join(self.save_dir, "calibrator_scores.json")
-            
-            if os.path.exists(calibrator_file):
-                with open(calibrator_file, 'r', encoding='utf-8') as f:
-                    existing_data = json.load(f)
-            else:
-                existing_data = {'calibrator_score_changes': []}
-            
-            # 添加新数据
-            existing_data['calibrator_score_changes'].append(calibrator_data)
-            
-            # 保存到文件
+            data_to_save = {'calibrator_score_changes': [calibrator_data]}
             with open(calibrator_file, 'w', encoding='utf-8') as f:
-                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+                json.dump(data_to_save, f, indent=2, ensure_ascii=False)
             
-            print(f"[CalibrationLogger] Logged calibrator scores for layer {layer_idx} to {calibrator_file}")
+            # print(f"[CalibrationLogger] Logged calibrator scores for layer {layer_idx} to {calibrator_file}")
             
         except Exception as e:
             print(f"[CalibrationLogger] Error logging calibrator scores: {e}")

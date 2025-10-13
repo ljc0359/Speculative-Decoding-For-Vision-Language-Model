@@ -80,6 +80,7 @@ def simple_evaluate(
     fewshot_random_seed: int = 1234,
     datetime_str: str = get_datetime_str(),
     cli_args=None,
+    bottom: Optional[int] = None,  # 新增参数
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -267,6 +268,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         cli_args=cli_args,
+        bottom=bottom,  # 新增：传递 bottom
     )
 
     if hasattr(lm, "_model"):
@@ -297,6 +299,7 @@ def simple_evaluate(
                 "device": device,
                 "use_cache": use_cache,
                 "limit": limit,
+                "bottom": bottom,  # 新增：记录 bottom
                 "bootstrap_iters": bootstrap_iters,
                 "gen_kwargs": gen_kwargs,
                 "random_seed": random_seed,
@@ -332,6 +335,7 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     cli_args=None,
+    bottom: Optional[int] = None,  # 新增参数
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -434,6 +438,7 @@ def evaluate(
             fewshot_as_multiturn=fewshot_as_multiturn,
             chat_template=getattr(lm, "apply_chat_template") if apply_chat_template else None,
             tokenizer_name=getattr(lm, "tokenizer_name", "") if apply_chat_template else "",
+            bottom=bottom,  # 新增：传递 bottom
         )
         eval_logger.debug(f"Task: {task_output.task_name}; number of requests on this rank: {len(task._instances)}")
         if write_out:
@@ -499,9 +504,10 @@ def evaluate(
             instances.sort(key=lambda x: x.idx)
         # iterate over different filters used
         for filter_key in task.instances[0].filtered_resps.keys():
-            doc_iterator = task.doc_iterator(rank=RANK, limit=limit, world_size=WORLD_SIZE)
-            doc_iterator_for_counting = itertools.islice(range(len(task.test_docs())), RANK, limit, WORLD_SIZE) if task.has_test_docs() else itertools.islice(range(len(task.validation_docs())), RANK, limit, WORLD_SIZE)
-            total_docs = sum(1 for _ in doc_iterator_for_counting)
+            # 使用 bottom 的 doc 迭代器
+            doc_iterator = task.doc_iterator(rank=RANK, limit=limit, world_size=WORLD_SIZE, bottom=bottom)
+            # 计数用相同迭代器，确保总量正确
+            total_docs = sum(1 for _ in task.doc_iterator(rank=RANK, limit=limit, world_size=WORLD_SIZE, bottom=bottom))
             pbar = tqdm(total=total_docs, desc=f"Postprocessing", disable=(RANK != 0))
             for doc_id, doc in doc_iterator:
                 requests = instances_by_doc_id[doc_id]

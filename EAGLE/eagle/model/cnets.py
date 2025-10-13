@@ -777,7 +777,9 @@ class Model(nn.Module):
         return calibration_data
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=0.7):
+        alpha = float(alpha)
+        
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
@@ -977,14 +979,14 @@ class Model(nn.Module):
                 # 使用校准后的置信度调整分数
                 calibrated_scores = torch.tensor(calibrated_probs, device=scores.device, dtype=scores.dtype)
                 # 将校准后的置信度与原始logits结合
-                # scores = scores * 0.7 + torch.log(calibrated_scores + 1e-8) * 0.3
+                # scores = scores * (1-alpha) + torch.log(calibrated_scores + 1e-8) * alpha
                 scores = torch.log(calibrated_scores + 1e-8)
                 scores_list[-1] = scores[None]
                 
                 logger.log_calibrator_scores(0, original_scores, calibrated_scores, scores, top_k)
 
                 
-                print(f"[Calibrator] Applied calibration to {top_k} candidates in layer 0")
+                # print(f"[Calibrator] Applied calibration to {top_k} candidates in layer 0")
             except Exception as e:
                 print(f"[Calibrator] Error applying calibration in layer 0: {e}")
     
@@ -1082,13 +1084,15 @@ class Model(nn.Module):
                         calibrated_probs, device=topk_p.device, dtype=topk_p.dtype
                     ).view(top_k, top_k)
                     
-                    # 使用校准后的置信度调整分数
+                    # 使用校准后的置信度与原分数按 alpha 进行组合（仿照第0层）
+                    # topk_p = original_topk_p * (1-alpha) + torch.log(calibrated_probs_tensor + 1e-8) * alpha
                     topk_p = torch.log(calibrated_probs_tensor + 1e-8)
+
                     local_scores_list[-1] = topk_p
                     
                     logger.log_calibrator_scores(i+1, original_topk_p.view(-1), calibrated_probs_tensor.view(-1), topk_p.view(-1), top_k * top_k)
 
-                    print(f"[Calibrator] Applied calibration to {top_k * top_k} candidates in layer {i+1}")
+                    # print(f"[Calibrator] Applied calibration to {top_k * top_k} candidates in layer {i+1}")
                 except Exception as e:
                     print(f"[Calibrator] Error applying calibration in layer {i+1}: {e}")
     
@@ -1159,8 +1163,8 @@ class Model(nn.Module):
             # 如果启用candidate calibration，记录所有candidate的数据
             if enable_candidate_calibration and candidate_calibration_data:
                 logger.log_candidate_calibration_data(candidate_calibration_data)
-                print(f"[DEBUG] Recorded {len(candidate_calibration_data)} candidate calibration samples")
-                print(f"[DEBUG] Sample calibration data: {candidate_calibration_data[:3]}")
+                # print(f"[DEBUG] Recorded {len(candidate_calibration_data)} candidate calibration samples")
+                # print(f"[DEBUG] Sample calibration data: {candidate_calibration_data[:3]}")
 
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)

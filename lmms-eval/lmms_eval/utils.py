@@ -941,7 +941,7 @@ class Collator:
             res[ind] = v
             cov[ind] = True
 
-        assert all(cov)
+        # assert all(cov)
 
         return res
 

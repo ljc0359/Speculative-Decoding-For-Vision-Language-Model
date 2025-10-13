@@ -146,6 +146,13 @@ def parse_eval_args() -> argparse.Namespace:
         default=None,
         help="Limit the number of examples per task. " "If <1, limit is a percentage of the total number of examples.",
     )
+    # 新增：只选择每个任务的倒数 X 个样本
+    parser.add_argument(
+        "--bottom",
+        type=int,
+        default=None,
+        help="Select only the last X examples per task (mutually exclusive with --limit).",
+    )
     parser.add_argument(
         "--use_cache",
         "-c",
@@ -518,6 +525,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         numpy_random_seed=args.seed[1],
         torch_random_seed=args.seed[2],
         fewshot_random_seed=args.seed[3],
+        bottom=args.bottom,
         cli_args=args,
         datetime_str=datetime_str,
         **request_caching_args,
