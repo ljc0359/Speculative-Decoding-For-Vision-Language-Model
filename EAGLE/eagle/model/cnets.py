@@ -777,15 +777,102 @@ class Model(nn.Module):
         return calibration_data
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=0.7):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=0.4):
         alpha = float(alpha)
         
+        # === helper: compute per-candidate adaptive alpha in [0, alpha] ===
+        def _compute_adaptive_alpha(data_list, base_alpha: float, layer_idx: int, shape=None, device=None, dtype=None):
+            """
+            data_list: list[dict] from _collect_calibration_data_safely
+            返回与候选同形状的 alpha 向量（或矩阵，对 layer_i 是 top_k*top_k）
+            规则（可按需调优）：
+            - margin 越小 -> 越依赖校准（alpha↑）
+            - depth 越深  -> 越依赖校准（alpha↑）
+            - 注意力越弱  -> 越依赖校准（alpha↑）
+            - token_category == 'number' 小幅增加（经验启发）
+            """
+            if (shape is None) or (device is None) or (dtype is None):
+                raise RuntimeError("adaptive alpha: shape/device/dtype must be provided")
+
+            # 默认：全部用 base_alpha（保证健壮）
+            if not data_list:
+                return torch.full(shape, base_alpha, device=device, dtype=dtype)
+
+            import numpy as np
+            # 提取字段（缺失则回退）
+            draft_margin = np.array([d.get('draft_margin', np.nan) for d in data_list], dtype=np.float64)
+            depth_arr    = np.array([d.get('tree_depth', d.get('layer', np.nan)) for d in data_list], dtype=np.float64)
+            attn_arr     = np.array([d.get('avg_visual_attention_intensity', np.nan) for d in data_list], dtype=np.float64)
+            token_cat    = [d.get('token_category', None) for d in data_list]
+
+            n = len(data_list)
+
+            # margin 因子：低 margin -> 高权重（线性缩放 + 分位裁切）
+            # 若 margin 缺失，用全体的中位数兜底；再缺失用 0.0
+            if np.isnan(draft_margin).all():
+                draft_margin[:] = 0.0
+            else:
+                med = np.nanmedian(draft_margin)
+                draft_margin = np.where(np.isnan(draft_margin), med, draft_margin)
+            # 用分位做归一化，避免极端值主导
+            m_lo, m_hi = np.nanpercentile(draft_margin, 10), np.nanpercentile(draft_margin, 90)
+            if m_hi <= m_lo:
+                m_lo, m_hi = float(np.min(draft_margin)), float(np.max(draft_margin) + 1e-8)
+            margin_norm = np.clip((draft_margin - m_lo) / (m_hi - m_lo + 1e-8), 0.0, 1.0)
+            # margin 越小越不确定 => alpha 越大
+            margin_factor = 1.0 - margin_norm  # [0,1]
+
+            # depth 因子：深度越深越不确定
+            if np.isnan(depth_arr).all():
+                depth_arr[:] = 1.0
+            else:
+                d_med = np.nanmedian(depth_arr)
+                depth_arr = np.where(np.isnan(depth_arr), d_med, depth_arr)
+            # 假定 1~6 合理范围，>6 截断；可按你的树深度分布调整
+            depth_factor = np.clip(depth_arr / 6.0, 0.0, 1.0)
+
+            # 注意力因子：注意力越弱（小）越不确定
+            if np.isnan(attn_arr).all():
+                attn_arr[:] = 0.5
+            else:
+                a_med = np.nanmedian(attn_arr)
+                attn_arr = np.where(np.isnan(attn_arr), a_med, attn_arr)
+            a_lo, a_hi = np.nanpercentile(attn_arr, 10), np.nanpercentile(attn_arr, 90)
+            if a_hi <= a_lo:
+                a_lo, a_hi = float(np.min(attn_arr)), float(np.max(attn_arr) + 1e-8)
+            attn_norm = np.clip((attn_arr - a_lo) / (a_hi - a_lo + 1e-8), 0.0, 1.0)
+            attn_factor = 1.0 - attn_norm  # 低注意力 -> 因子大
+
+            # token 类别微调
+            tok_boost = np.ones(n, dtype=np.float64)
+            for i, cat in enumerate(token_cat):
+                if isinstance(cat, str) and cat.lower() == 'number':
+                    tok_boost[i] = 1.40  # number 稍微更信任校准
+                else:
+                    tok_boost[i] = 1.00
+
+            # 组合：加权平均再乘微调；避免过激，最后整体缩放到 [0.2, 1.0]
+            # 可调系数：margin 0.5, depth 0.3, attn 0.2
+            combo = (0.5 * margin_factor + 0.3 * depth_factor + 0.2 * attn_factor)
+            combo = np.clip(combo * tok_boost, 0.0, 1.2)
+            combo = np.clip(combo, 0.2, 1.0)  # 保底 0.2，避免 alpha 过小无效
+
+            alpha_vec = base_alpha * combo  # 限制不超过全局 alpha
+            alpha_t = torch.tensor(alpha_vec, device=device, dtype=dtype)
+            if len(shape) == 2:
+                # layer_i: 需要 reshape 成 [top_k, top_k]
+                try:
+                    alpha_t = alpha_t.view(*shape)
+                except Exception:
+                    alpha_t = alpha_t[: (shape[0] * shape[1])].view(*shape)
+            return alpha_t
+
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
         sample_token = input_ids[:, -1]
-    
+
         if inputs_embeds is not None:
             new_embed = self.embed_tokens(sample_token).unsqueeze(dim=0).to(inputs_embeds.device)
             inputs_embeds = torch.cat((inputs_embeds[:, 1:], new_embed), dim=1)
@@ -796,20 +883,14 @@ class Model(nn.Module):
         scores_list = []
         parents_list = []
         ss_token = []
-    
+        
         len_posi = input_ids.shape[1]
-    
         if (input_ids == -200).any():
             len_posi += 575
-    
+
         self.reset()
-        # 存储candidate calibration数据
         candidate_calibration_data = []
         
-        # 保存原始context用于candidate calibration
-        original_context = input_ids.clone()
-        
-        # 获取图像token位置信息（用于注意力计算）
         img_start_idx, img_end_idx = None, None
         if CALIBRATION_LOGGING_ENABLED and enable_candidate_calibration:
             from eagle.model.image_token_utils import calculate_image_token_positions_for_calibration
@@ -820,19 +901,16 @@ class Model(nn.Module):
                 image_features=None,
                 batch_idx=0
             )
-            # 由于input_ids已经去掉了第一个token，需要调整位置
             if img_start_idx is not None:
                 img_start_idx = max(0, img_start_idx - 1)
             if img_end_idx is not None:
                 img_end_idx = max(0, img_end_idx - 1)
-            # print(f"[DEBUG] Image token positions for attention: [{img_start_idx}:{img_end_idx}]")
-        
+
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
             if -200 in input_ids:
                 kv_len -= 575
-            
-            # 在候选校准模式下获取注意力权重
+
             if enable_candidate_calibration:
                 out_hidden, past_key_values, _, attentions = self(
                     hidden_states, 
@@ -858,7 +936,6 @@ class Model(nn.Module):
             elif 151652 in input_ids:
                 image_tokens_num = [(input_ids == 151655).sum().item()]
             
-            # 在候选校准模式下获取注意力权重
             if enable_candidate_calibration:
                 out_hidden, past_key_values, _, attentions = self(
                     hidden_states, 
@@ -877,75 +954,64 @@ class Model(nn.Module):
                     image_tokens_num=image_tokens_num
                 )
                 attentions = None
-    
+
         self.stable_kv = past_key_values
+
         if CALIBRATION_LOGGING_ENABLED:
             logger = get_calibration_logger()
-            
-            # 使用新的图像token位置计算方法
             from eagle.model.image_token_utils import calculate_image_token_positions_for_calibration
-            
-            # 尝试从inputs_embeds推断图像token位置
             original_input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
-            
             img_start_idx_log, img_end_idx_log = calculate_image_token_positions_for_calibration(
                 input_ids=original_input_ids,
                 inputs_embeds=inputs_embeds,
                 image_features=None,
                 batch_idx=0
             )
-            
-            # 由于input_ids已经去掉了第一个token，需要调整位置
             if img_start_idx_log is not None:
                 img_start_idx_log = max(0, img_start_idx_log - 1)
             if img_end_idx_log is not None:
                 img_end_idx_log = max(0, img_end_idx_log - 1)
-            # print("img_start_idx, img_end_idx", img_start_idx_log, img_end_idx_log)
             logger.start_draft_session(img_start_idx=img_start_idx_log, img_end_idx=img_end_idx_log)
-    
-        # 初始化用于后续层的 KV 缓存，避免 UnboundLocalError
+
         past_key_values = self.stable_kv
-    
         last_hidden = out_hidden[:, -1]
         last_headout = head(last_hidden)
         last_p = self.logsoftmax(last_headout)
-    
-        # --- 第 0 层 ---
+
+        # ---------- 第 0 层 ----------
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
         scores_list.append(scores[None])
-    
-        # 记录第0层的局部分数和位置信息（保持原有）
+
         local_scores_list = []
         token_list = []
         position_labels_list = []
         depth_labels_list = []
         parent_labels_list = []
         next_position_idx = 1
-    
+
         local_scores_list.append(topk_p)
         token_list.append(topk_index)
-    
+
         layer_positions = torch.arange(next_position_idx, next_position_idx + top_k, device=topk_index.device)
         layer_depths = torch.ones(top_k, device=topk_index.device)
         layer_parents = torch.zeros(top_k, device=topk_index.device)
-    
+
         position_labels_list.append(layer_positions)
         depth_labels_list.append(layer_depths)
         parent_labels_list.append(layer_parents)
         next_position_idx += top_k
-    
+
         frontier_paths = [[topk_index[0, p].item()] for p in range(top_k)]
-    
-        # 使用安全的候选校准函数 - 第0层
+
+        layer_0_data = None
         if enable_candidate_calibration and base_model is not None:
             if context_past_key_values is None:
                 raise RuntimeError("topK_genrate: context_past_key_values 为 None；请从 initialize_tree 传入初始化的 KVCache。")
-        
             layer_0_data = self._collect_calibration_data_safely(
                 base_model=base_model,
-                original_context=original_context,
+                original_context=input_ids.clone(),
                 inputs_embeds=inputs_embeds,
                 context_past_key_values=context_past_key_values,
                 topk_index=topk_index,
@@ -954,55 +1020,57 @@ class Model(nn.Module):
                 layer_depths=layer_depths,
                 layer_parents=layer_parents,
                 layer_idx=0,
-                attentions=attentions,  # 传递注意力权重
+                attentions=attentions,
                 img_start_idx=img_start_idx,
                 img_end_idx=img_end_idx,
-                train_calibrator=train_calibrator  # 传递训练模式参数
+                train_calibrator=train_calibrator
             )
             candidate_calibration_data.extend(layer_0_data)
 
-        # 如果使用校准器，对第0层的候选进行校准
-        # print(f"[debug] use_calibrator: {use_calibrator} calibrator {calibrator} train_calibrator {train_calibrator}")
-        if use_calibrator and calibrator is not None and not train_calibrator:
-            # 从 _collect_calibration_data_safely 获取的数据中提取特征
-            
-            # 使用校准器预测置信度
+        # 自适应 alpha 融合（仅当采集到 layer_0_data）
+        if use_calibrator and calibrator is not None and not train_calibrator and (layer_0_data is not None):
             try:
                 import pandas as pd
+                import numpy as np
                 
-                # 保存原始分数用于对比和记录
                 original_scores = scores.clone()
-                
+
                 features_df = pd.DataFrame(layer_0_data)
                 calibrated_probs = calibrator.predict_proba(features_df)
-                
-                # 使用校准后的置信度调整分数
-                calibrated_scores = torch.tensor(calibrated_probs, device=scores.device, dtype=scores.dtype)
-                # 将校准后的置信度与原始logits结合
-                # scores = scores * (1-alpha) + torch.log(calibrated_scores + 1e-8) * alpha
-                scores = torch.log(calibrated_scores + 1e-8)
-                scores_list[-1] = scores[None]
-                
-                logger.log_calibrator_scores(0, original_scores, calibrated_scores, scores, top_k)
+                calibrated_probs = np.clip(calibrated_probs, 1e-8, 1 - 1e-8)
 
-                
-                # print(f"[Calibrator] Applied calibration to {top_k} candidates in layer 0")
+                # 计算自适应 alpha（shape = [top_k]）
+                alpha_vec = _compute_adaptive_alpha(
+                    data_list=layer_0_data,
+                    base_alpha=alpha,
+                    layer_idx=0,
+                    shape=(top_k,),
+                    device=scores.device,
+                    dtype=scores.dtype
+                )
+
+                calibrated_scores = torch.tensor(calibrated_probs, device=scores.device, dtype=scores.dtype)
+                # scores_new = (1 - α_i) * old + α_i * log(calib)
+                scores = scores * (1 - alpha_vec) + torch.log(calibrated_scores) * alpha_vec
+                scores_list[-1] = scores[None]
+
+                if CALIBRATION_LOGGING_ENABLED:
+                    logger.log_calibrator_scores(0, original_scores, calibrated_scores, scores, top_k)
             except Exception as e:
                 print(f"[Calibrator] Error applying calibration in layer 0: {e}")
-    
-        # 设备统一到 hidden_states.device，避免受 scores 异常影响
+
         parents_list.append(torch.zeros(1, dtype=torch.long, device=hidden_states.device))
         ss_token.append(topk_index)
         input_ids = topk_index
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
-    
-        # 后续层的处理
+
+        # ---------- 后续各层 ----------
         for i in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
-    
+
             out_hidden, past_key_values, _, layer_attentions = self(
                 input_hidden,
                 input_ids=input_ids,
@@ -1012,28 +1080,26 @@ class Model(nn.Module):
                 output_attentions=True
             )
             len_posi += 1
-    
+
             bias1 = top_k if i > 0 else 0
             bias2 = max(0, i - 1)
             bias = 1 + top_k ** 2 * bias2 + bias1
             parents = (topk_cs_index + bias)
             parents_list.append(parents)
-    
+
             last_headout = head(out_hidden[0])
             last_p = self.logsoftmax(last_headout)
-    
-            # --- 之后每一层 ---
+
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
-    
-            # 记录树信息（保持原有）
+
             local_scores_list.append(topk_p)
             token_list.append(topk_index)
-    
+
             current_depth = i + 2
             layer_positions = torch.arange(next_position_idx, next_position_idx + top_k * top_k, device=topk_index.device)
             layer_depths = torch.full((top_k * top_k,), current_depth, device=topk_index.device)
-    
+
             parent_positions_for_layer = []
             for parent_idx in range(top_k):
                 if i == 0:
@@ -1042,18 +1108,18 @@ class Model(nn.Module):
                     parent_pos = next_position_idx - top_k * top_k + parent_idx * top_k
                 parent_positions_for_layer.extend([parent_pos] * top_k)
             layer_parents = torch.tensor(parent_positions_for_layer, device=topk_index.device)
-    
+
             position_labels_list.append(layer_positions)
             depth_labels_list.append(layer_depths)
             parent_labels_list.append(layer_parents)
-    
-            # 使用安全的候选校准函数 - 后续层
+
+            layer_i_data = None
             if enable_candidate_calibration and base_model is not None:
                 layer_i_data = self._collect_calibration_data_safely(
                     base_model=base_model,
-                    original_context=original_context,
+                    original_context=input_ids.clone(),
                     inputs_embeds=inputs_embeds,
-                    context_past_key_values=None,  # 后续层不使用KV缓存
+                    context_past_key_values=None,
                     topk_index=topk_index,
                     topk_p=topk_p,
                     layer_positions=layer_positions,
@@ -1061,54 +1127,58 @@ class Model(nn.Module):
                     layer_parents=layer_parents,
                     layer_idx=i + 1,
                     frontier_paths=frontier_paths,
-                    attentions=layer_attentions,  # 传递注意力权重
+                    attentions=layer_attentions,
                     img_start_idx=img_start_idx,
                     img_end_idx=img_end_idx,
-                    train_calibrator=train_calibrator  # 传递训练模式参数
+                    train_calibrator=train_calibrator
                 )
                 candidate_calibration_data.extend(layer_i_data)
 
-            # 如果使用校准器，对后续层的候选进行校准
-            if use_calibrator and calibrator is not None and not train_calibrator:
+            # 校准 + 自适应 alpha（仅当采集到 layer_i_data）
+            if use_calibrator and calibrator is not None and not train_calibrator and (layer_i_data is not None):
                 try:
                     import pandas as pd
-
-                    # 保存原始分数用于对比和记录
                     original_topk_p = topk_p.clone()
 
                     features_df = pd.DataFrame(layer_i_data)
                     calibrated_probs = calibrator.predict_proba(features_df)
-                    
-                    # 将校准后的置信度重塑为 [top_k, top_k] 形状
+                    calibrated_probs = np.clip(calibrated_probs, 1e-8, 1 - 1e-8)
+
+                    # 计算自适应 alpha（shape = [top_k, top_k]）
+                    alpha_mat = _compute_adaptive_alpha(
+                        data_list=layer_i_data,
+                        base_alpha=alpha,
+                        layer_idx=i + 1,
+                        shape=(top_k, top_k),
+                        device=topk_p.device,
+                        dtype=topk_p.dtype
+                    )
+
                     calibrated_probs_tensor = torch.tensor(
                         calibrated_probs, device=topk_p.device, dtype=topk_p.dtype
                     ).view(top_k, top_k)
-                    
-                    # 使用校准后的置信度与原分数按 alpha 进行组合（仿照第0层）
-                    # topk_p = original_topk_p * (1-alpha) + torch.log(calibrated_probs_tensor + 1e-8) * alpha
-                    topk_p = torch.log(calibrated_probs_tensor + 1e-8)
 
+                    # topk_p_new = (1 - α_ij)*old + α_ij*log(calib)
+                    topk_p = (1 - alpha_mat) * original_topk_p + alpha_mat * torch.log(calibrated_probs_tensor)
                     local_scores_list[-1] = topk_p
-                    
-                    logger.log_calibrator_scores(i+1, original_topk_p.view(-1), calibrated_probs_tensor.view(-1), topk_p.view(-1), top_k * top_k)
 
-                    # print(f"[Calibrator] Applied calibration to {top_k * top_k} candidates in layer {i+1}")
+                    if CALIBRATION_LOGGING_ENABLED:
+                        logger.log_calibrator_scores(i + 1, original_topk_p.view(-1), calibrated_probs_tensor.view(-1), topk_p.view(-1), top_k * top_k)
                 except Exception as e:
                     print(f"[Calibrator] Error applying calibration in layer {i+1}: {e}")
-    
+
             cu_scores = topk_p + scores[:, None]
             topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
             scores = topk_cs_p
-    
+
             out_ids = topk_cs_index // top_k
             input_hidden = out_hidden[:, out_ids]
             input_ids = topk_index.view(-1)[topk_cs_index][None]
-    
+
             ss_token.append(topk_index)
             scores_list.append(cu_scores)
-    
-            # 更新前沿路径
+
             new_frontier_paths = []
             for selected_idx in topk_cs_index.tolist():
                 parent_idx = selected_idx // top_k
@@ -1117,40 +1187,35 @@ class Model(nn.Module):
                 new_path = frontier_paths[parent_idx] + [selected_token]
                 new_frontier_paths.append(new_path)
             frontier_paths = new_frontier_paths
-    
+
             next_position_idx += top_k * top_k
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
-    
-        # 获取所有候选的分数和token
-        scores_flat = torch.cat(scores_list, dim=0).reshape(-1)        # 累计分数
-        local_scores_flat = torch.cat(local_scores_list, dim=0).reshape(-1)  # 局部分数
-        tokens_flat = torch.cat(token_list, dim=0).reshape(-1)         # tokens
-        positions_flat = torch.cat(position_labels_list, dim=0).reshape(-1)  # 位置
-        depths_flat = torch.cat(depth_labels_list, dim=0).reshape(-1)        # 深度
-        parents_flat = torch.cat(parent_labels_list, dim=0).reshape(-1)      # 父节点位置
+        # ---------- 汇总与返回 ----------
+        scores_flat = torch.cat(scores_list, dim=0).reshape(-1)
+        local_scores_flat = torch.cat(local_scores_list, dim=0).reshape(-1)
+        tokens_flat = torch.cat(token_list, dim=0).reshape(-1)
+        positions_flat = torch.cat(position_labels_list, dim=0).reshape(-1)
+        depths_flat = torch.cat(depth_labels_list, dim=0).reshape(-1)
+        parents_flat = torch.cat(parent_labels_list, dim=0).reshape(-1)
         
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
         
-        # 选择最终的draft tokens
         top_scores = torch.topk(scores_flat, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
-    
+
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
-        
-        # 记录最终被选中的draft tokens的所有信息
+
+
         if CALIBRATION_LOGGING_ENABLED:
             logger = get_calibration_logger()
-            # 获取最终选中的tokens的各种信息（不包括sample_token）
-            selected_path_scores = scores_flat[top_scores_index]      # 路径累计分数
-            selected_local_scores = local_scores_flat[top_scores_index]  # 局部分数
-            selected_tokens = draft_tokens[1:]                        # 排除sample_token
-            selected_positions = positions_flat[top_scores_index]     # 树位置
-            selected_depths = depths_flat[top_scores_index]           # 树深度
-            selected_parents = parents_flat[top_scores_index]         # 父节点位置
-            
-            # 记录所有信息
+            selected_path_scores = scores_flat[top_scores_index]
+            selected_local_scores = local_scores_flat[top_scores_index]
+            selected_tokens = draft_tokens[1:]
+            selected_positions = positions_flat[top_scores_index]
+            selected_depths = depths_flat[top_scores_index]
+            selected_parents = parents_flat[top_scores_index]
             logger.log_draft_confidence(
                 path_confidence_scores=selected_path_scores,
                 local_confidence_scores=selected_local_scores,
@@ -1159,12 +1224,8 @@ class Model(nn.Module):
                 tree_depths=selected_depths,
                 parent_positions=selected_parents
             )
-            
-            # 如果启用candidate calibration，记录所有candidate的数据
             if enable_candidate_calibration and candidate_calibration_data:
                 logger.log_candidate_calibration_data(candidate_calibration_data)
-                # print(f"[DEBUG] Recorded {len(candidate_calibration_data)} candidate calibration samples")
-                # print(f"[DEBUG] Sample calibration data: {candidate_calibration_data[:3]}")
 
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
@@ -1207,7 +1268,6 @@ class Model(nn.Module):
 
         if logits_processor is not None:
             maxitem = total_tokens + 5
-
             def custom_sort(lst):
                 sort_keys = []
                 for i in range(len(lst)):
@@ -1217,7 +1277,6 @@ class Model(nn.Module):
             retrieve_indices = sorted(retrieve_indices, key=custom_sort)
 
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
-        del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids

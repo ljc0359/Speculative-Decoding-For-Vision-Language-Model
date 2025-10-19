@@ -473,9 +473,9 @@ def evaluate(
 
         resps = getattr(lm, reqtype)(cloned_reqs)
 
-        if hasattr(lm.model, "acclen") and lm.model.accnum > 0:
-            acceptance_len = ((lm.model.acclen / lm.model.accnum) + 1)
-            eval_logger.success(f"The acceptance length is {acceptance_len:.2f}")
+        # if hasattr(lm.model, "acclen") and lm.model.accnum > 0:
+        #     acceptance_len = ((lm.model.acclen / lm.model.accnum) + 1)
+        #     eval_logger.success(f"The acceptance length is {lm.model.acclen}/{lm.model.accnum}={acceptance_len:.2f}")
 
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):

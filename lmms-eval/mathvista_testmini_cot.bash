@@ -7,10 +7,10 @@ python -m lmms_eval \
   --model llava_msd_calibrated \
   --model_args pretrained="/root/Speculative_decoding/checkpoint/llava-v1.5-7b" \
   --msd_model_path /root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-7B \
-  --tasks textvqa \
+  --tasks mathvista_testmini_cot \
   --batch_size 1 \
-  --gen_kwargs temperature=1 \
+  --gen_kwargs temperature=0 \
   --use_msd \
   --log_samples \
-  --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/textvqa.json \
-  --limit 500
+  --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/mathvista_testmini.json \
+  --limit 1000

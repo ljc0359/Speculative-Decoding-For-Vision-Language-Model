@@ -210,35 +210,8 @@ class BaseCalibrator(ABC):
 
     @classmethod
     def load(cls, path: str):
-        # 兼容旧 pickle 的命名空间映射
-        class _CompatUnpickler(pickle.Unpickler):
-            def find_class(self_inner, module, name):
-                from eagle.model.calibrators import (
-                    GroupedIsotonicCalibrator,
-                    MonotonicNetworkCalibrator,
-                    MonotonicMLP,
-                )
-                mapping = {
-                    "GroupedIsotonicCalibrator": GroupedIsotonicCalibrator,
-                    "MonotonicNetworkCalibrator": MonotonicNetworkCalibrator,
-                    "MonotonicMLP": MonotonicMLP,
-                    "_AffineMono": MonotonicNetworkCalibrator._AffineMono,
-                    "MonotonicNetworkCalibrator._AffineMono": MonotonicNetworkCalibrator._AffineMono,
-                }
-                if name in mapping and module in (
-                    "lmms_eval.__main__",
-                    "__main__",
-                    "eagle.model.calibrators",
-                ):
-                    return mapping[name]
-                if name.endswith("._AffineMono"):
-                    return MonotonicNetworkCalibrator._AffineMono
-                if name in mapping:
-                    return mapping[name]
-                return super(_CompatUnpickler, self_inner).find_class(module, name)
-
         with open(path, 'rb') as f:
-            return _CompatUnpickler(f).load()
+            return pickle.load(f)
 
 # =========================
 # Grouped Isotonic
@@ -480,288 +453,6 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                             out[mask] = self.global_mean
         return np.clip(out, 1e-4, 1 - 1e-4)
 
-
-class MonotonicNetworkCalibrator(BaseCalibrator):
-    """
-    更激进的单调网络校准器（特征条件 Logit 仿射）
-      logit(p̂) = a(φ) + b(φ) * logit(c)
-      其中 b(φ) = 1 + softplus(s(φ))  >= 1  —— 对 c 单调且“放大”高分区
-    """
-
-    def __init__(self,
-                 hidden_dim: int = 64,
-                 learning_rate: float = 1e-3,
-                 max_epochs: int = 600,
-                 patience: int = 50,
-                 device: str = None,
-                 weight_decay: float = 1e-4,
-                 grad_clip: float = 1.0,
-                 max_slope: float = 6.0,          # b(φ) 的最大值（防数值爆炸）
-                 n_reweight_bins: int = 20):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.learning_rate = learning_rate
-        self.max_epochs = max_epochs
-        self.patience = patience
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.weight_decay = weight_decay
-        self.grad_clip = grad_clip
-        self.max_slope = float(max_slope)
-        self.n_reweight_bins = n_reweight_bins
-
-        # 训练期统计
-        self.z_mean = None
-        self.z_std = None
-        self.model = None
-        set_seed(42)
-
-    # ---------- utils ----------
-    @staticmethod
-    def _equal_freq_weights(conf: np.ndarray, n_bins: int = 20) -> np.ndarray:
-        c = np.asarray(conf, dtype=np.float64)
-        edges = np.quantile(c, np.linspace(0, 1, n_bins + 1))
-        edges = np.unique(edges)
-        bins = np.digitize(c, edges[1:-1], right=True)
-        counts = np.bincount(bins, minlength=len(edges) - 1).astype(np.float64)
-        counts[counts == 0] = 1.0
-        w = 1.0 / counts[bins]
-        return (w * (len(w) / w.sum())).astype('float32')
-
-    def _build_phi(self, proc: Dict[str, np.ndarray]) -> np.ndarray:
-        # one-hot / 归一化 与你现有 BaseCalibrator 的预处理保持一致
-        token = np.eye(3)[proc['token_type']]
-        # attn_q 五等分分组 -> 5 维 one-hot（防越界）
-        attn_idx = np.asarray(proc['attn_q'], dtype=int)
-        attn_idx = np.clip(attn_idx, 0, 4)
-        attn = np.eye(5)[attn_idx]
-        pos  = np.eye(2)[proc['pos_bin']]
-
-        # 新增：draft_margin 的三等分分组 -> 3 维 one-hot
-        # 若预处理提供 margin_q 则直接使用；否则在线计算并带回退保护
-        if 'margin_q' in proc:
-            m_q_idx = np.asarray(proc['margin_q'], dtype=int)
-            m_q_idx = np.clip(m_q_idx, 0, 2)
-        elif 'draft_margin' in proc:
-            m = np.asarray(proc['draft_margin'], dtype=np.float64)
-            edges = np.quantile(m, [0.33, 0.67])
-            m_q_idx = np.digitize(m, edges, right=True)  # 0,1,2
-        else:
-            m_q_idx = np.zeros(token.shape[0], dtype=int)
-        margin_q_oh = np.eye(3)[m_q_idx]
-
-        td = proc['tree_depth']
-        tmin, tmax = float(td.min()), float(td.max())
-        tree = ((td - tmin) / (tmax - tmin + 1e-8)).reshape(-1, 1)
-
-        ai = proc['avg_visual_attention_intensity']
-        amin, amax = float(ai.min()), float(ai.max())
-        attn_norm = ((ai - amin) / (amax - amin + 1e-8)).reshape(-1, 1)
-
-        parts = [token, attn, pos, margin_q_oh, tree, attn_norm]
-
-        if 'draft_margin' in proc:
-            m = proc['draft_margin']
-            mmin, mmax = float(m.min()), float(m.max())
-            parts.append(((m - mmin) / (mmax - mmin + 1e-8)).reshape(-1, 1))
-
-        phi = np.concatenate(parts, axis=1).astype('float32')
-        self.phi_dim = int(phi.shape[1])
-        return phi
-
-    def _logit_and_standardize(self, conf: np.ndarray, fit_mode: bool) -> np.ndarray:
-        c = np.clip(np.asarray(conf, dtype=np.float32), 1e-6, 1 - 1e-6)
-        z = np.log(c) - np.log(1.0 - c)  # logit(c)
-        if fit_mode or (self.z_mean is None) or (self.z_std is None):
-            self.z_mean = float(z.mean())
-            self.z_std = float(z.std() + 1e-6)
-        z = (z - self.z_mean) / self.z_std
-        return z.astype('float32')
-
-    # ---------- model ----------
-    class _AffineMono(nn.Module):
-        """φ -> a, s； b = 1 + softplus(s)；logits = a + clamp(b,1,max_slope) * z"""
-        def __init__(self, phi_dim: int, hidden_dim: int, max_slope: float):
-            super().__init__()
-            self.max_slope = max_slope
-            self.backbone = nn.Sequential(
-                nn.Linear(phi_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(inplace=True)
-            )
-            self.head_a = nn.Linear(hidden_dim, 1)
-            self.head_s = nn.Linear(hidden_dim, 1)  # slope raw
-
-        def forward(self, phi: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-            h = self.backbone(phi)
-            a = self.head_a(h).squeeze(-1)
-            s = self.head_s(h).squeeze(-1)
-            b = 1.0 + F.softplus(s)                  # >=1
-            if self.max_slope is not None:
-                b = torch.clamp(b, max=self.max_slope)
-            logits = a + b * z
-            return logits
-
-    # ---------- fit/predict ----------
-    def fit(self,
-            features: Dict[str, np.ndarray],
-            soft_labels: np.ndarray,
-            hard_labels: np.ndarray,
-            sample_weights: Optional[np.ndarray] = None):
-
-        proc = self._preprocess_features(features, fit_mode=True)
-        phi = self._build_phi(proc)
-        z = self._logit_and_standardize(proc['draft_conf'], fit_mode=True)
-
-        # 目标用硬标签（更贴近“是否接受”）
-        y = np.asarray(hard_labels, dtype=np.float32)
-        # 等频重加权（conf 段均衡）
-        if sample_weights is None:
-            w = self._equal_freq_weights(proc['draft_conf'], self.n_reweight_bins)
-        else:
-            w = np.asarray(sample_weights, dtype=np.float32)
-
-        # 类不平衡：pos_weight
-        pos_rate = float(y.mean())
-        pos_weight = (1.0 - pos_rate) / max(pos_rate, 1e-6)
-        pos_weight = max(1.0, min(30.0, pos_weight))
-
-        # tensor
-        device = self.device
-        phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
-        z_t   = torch.tensor(z, dtype=torch.float32, device=device)
-        y_t   = torch.tensor(y, dtype=torch.float32, device=device)
-        w_t   = torch.tensor(w, dtype=torch.float32, device=device)
-
-        self.model = self._AffineMono(self.phi_dim, self.hidden_dim, self.max_slope).to(device)
-
-        # 初始化 a 的偏置为全局 logit(pos_rate)
-        with torch.no_grad():
-            b0 = float(np.log(pos_rate + 1e-8) - np.log(1 - pos_rate + 1e-8))
-            nn.init.zeros_(self.model.head_a.weight)
-            nn.init.constant_(self.model.head_a.bias, b0)
-            nn.init.zeros_(self.model.head_s.weight)
-            nn.init.constant_(self.model.head_s.bias, 0.0)  # slope 初始 ~ 1+softplus(0)=1.693
-
-        opt = torch.optim.AdamW(self.model.parameters(),
-                                lr=self.learning_rate,
-                                weight_decay=self.weight_decay)
-        bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device), reduction='none')
-
-        # train/val split
-        n = phi_t.size(0)
-        idx = torch.randperm(n, device=device)
-        split = max(int(0.9 * n), 1)
-        tr, va = idx[:split], idx[split:]
-
-        best, patience, best_sd = float('inf'), self.patience, None
-        for ep in range(self.max_epochs):
-            # train
-            self.model.train(); opt.zero_grad()
-            logits_tr = self.model(phi_t[tr], z_t[tr])
-            loss_vec  = bce(logits_tr, y_t[tr]) * w_t[tr]
-            loss = loss_vec.mean()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            opt.step()
-
-            # val
-            self.model.eval()
-            with torch.no_grad():
-                logits_va = self.model(phi_t[va], z_t[va])
-                loss_va = (bce(logits_va, y_t[va]) * w_t[va]).mean()
-
-            if (ep % 20) == 0:
-                p_tr = torch.sigmoid(logits_tr).detach().cpu().numpy()
-                print(f"[MonoAgg] Epoch {ep:03d}  train={float(loss):.4f}  val={float(loss_va):.4f}  "
-                      f"p[min/mean/max]={p_tr.min():.3f}/{p_tr.mean():.3f}/{p_tr.max():.3f}")
-
-            if float(loss_va) + 1e-6 < best:
-                best, patience = float(loss_va), self.patience
-                best_sd = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-            else:
-                patience -= 1
-                if patience <= 0:
-                    break
-
-        if best_sd is not None:
-            self.model.load_state_dict(best_sd)
-
-        self.is_fitted = True
-
-    def predict_proba(self, features: Dict[str, np.ndarray]) -> np.ndarray:
-        if not self.is_fitted:
-            raise ValueError("Call fit() first")
-
-        proc = self._preprocess_features(features, fit_mode=False)
-        phi = self._build_phi(proc)
-        z = self._logit_and_standardize(proc['draft_conf'], fit_mode=False)
-
-        device = self.device
-        phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
-        z_t   = torch.tensor(z, dtype=torch.float32, device=device)
-        self.model.eval()
-        with torch.no_grad():
-            logits = self.model(phi_t, z_t)
-            p = torch.sigmoid(logits).clamp(1e-4, 1 - 1e-4).cpu().numpy()
-        return p.astype('float32')
-
-
-
-class MonotonicMLP(nn.Module):
-    """单调MLP模型
-    
-    logit(p_tilde) = β(φ) + Σ_k γ_k(φ) * s_k(c)
-    其中 γ_k(φ) ≥ 0 通过 softplus 确保
-    """
-    
-    def __init__(self, phi_dim: int, n_basis: int, hidden_dim: int):
-        super().__init__()
-        self.phi_dim = phi_dim
-        self.n_basis = n_basis
-        self.hidden_dim = hidden_dim
-        
-        # β(φ) 网络 - 偏置项
-        self.beta_net = nn.Sequential(
-            nn.Linear(phi_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
-        # γ_k(φ) 网络 - 单调系数（确保非负）
-        self.gamma_net = nn.Sequential(
-            nn.Linear(phi_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, n_basis)
-        )
-        
-    def forward(self, phi: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            phi: 特征向量 (batch_size, phi_dim)
-            basis: 基函数值 (batch_size, n_basis)
-        
-        Returns:
-            logits: (batch_size,)
-        """
-        # 计算偏置项 β(φ)
-        beta = self.beta_net(phi).squeeze(-1)  # (batch_size,)
-        
-        # 计算单调系数 γ_k(φ)，使用 softplus 确保非负
-        gamma = F.softplus(self.gamma_net(phi))  # (batch_size, n_basis)
-        
-        # 计算单调项 Σ_k γ_k(φ) * s_k(c)
-        monotonic_term = (gamma * basis).sum(dim=1)  # (batch_size,)
-        
-        # 最终logit
-        logits = beta + monotonic_term
-        
-        return logits
-        
 # =========================
 # Data loader + quick tests
 # =========================
@@ -803,16 +494,16 @@ def _print_metrics(name: str, metrics: Dict[str, float]):
 
 def calibrator_training(calibrator_dir: str, json_path: str):
     """
-    训练 Grouped Isotonic 与 Monotonic Network 两种校准器并保存到指定目录。
+    训练 Grouped Isotonic 校准器并保存到指定目录。
     参数:
         calibrator_dir: 输出保存目录（若不存在会创建）
         json_path: 训练数据 JSON 文件路径（需包含 features/soft_labels/hard_labels）
     返回:
-        (GroupedIsotonicCalibrator, MonotonicNetworkCalibrator)
+        训练好的 GroupedIsotonicCalibrator 实例
     """
     set_seed(42)
     print("=" * 60)
-    print(f"[Calibrator] Training Grouped Isotonic & Monotonic Network from JSON: {json_path}")
+    print(f"[Calibrator] Training Grouped Isotonic from JSON: {json_path}")
     print("=" * 60)
 
     # 加载数据
@@ -821,42 +512,84 @@ def calibrator_training(calibrator_dir: str, json_path: str):
     print(f"[Calibrator] Loaded {n} samples; pos_rate={hard.mean():.4f}")
     print(f"[Calibrator] Feature keys: {list(feats.keys())}")
 
-    os.makedirs(calibrator_dir, exist_ok=True)
-
     # 训练 Isotonic（硬标签）
     gi = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard')
     gi.fit(feats, soft, hard)
-    metrics_gi = gi.evaluate(feats, soft, hard)
-    gi_model_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
-    gi_metrics_path = os.path.join(calibrator_dir, "grouped_isotonic_metrics.json")
-    gi.save(gi_model_path)
-    with open(gi_metrics_path, "w") as f:
-        json.dump(metrics_gi, f, indent=2)
-    print(f"[Calibrator] Saved Isotonic calibrator to: {gi_model_path}")
-    print(f"[Calibrator] Saved training metrics to: {gi_metrics_path}")
 
-    # 设备检查：若有 GPU 则用 CUDA，否则用 CPU
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"[Calibrator] Using device for Monotonic Network: {device}")
+    # 评估并保存
+    metrics = gi.evaluate(feats, soft, hard)
+    os.makedirs(calibrator_dir, exist_ok=True)
+    model_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
+    metrics_path = os.path.join(calibrator_dir, "grouped_isotonic_metrics.json")
+    gi.save(model_path)
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
 
-    # 训练 Monotonic Network（软标签）
-    mn = MonotonicNetworkCalibrator(hidden_dim=64, learning_rate=1e-3, max_epochs=1000, patience=50, device=device)
-    mn.fit(feats, soft, hard)
-    metrics_mn = mn.evaluate(feats, soft, hard)
-    mn_model_path = os.path.join(calibrator_dir, "monotonic_network_calibrator.pkl")
-    mn_metrics_path = os.path.join(calibrator_dir, "monotonic_network_metrics.json")
-    mn.save(mn_model_path)
-    with open(mn_metrics_path, "w") as f:
-        json.dump(metrics_mn, f, indent=2)
-    print(f"[Calibrator] Saved Monotonic Network calibrator to: {mn_model_path}")
-    print(f"[Calibrator] Saved training metrics to: {mn_metrics_path}")
+    print(f"[Calibrator] Saved Isotonic calibrator to: {model_path}")
+    print(f"[Calibrator] Saved training metrics to: {metrics_path}")
+    return gi
 
-    return gi, mn
+def test_calibrator_training():
+    set_seed(42)
+    data_path = "/root/Speculative_decoding/calibration_data/chartqa_train_40_val_0_test_60_total_100/non_calibrator/training_calibration_data.json"
+    print("=" * 60)
+    print("Testing Calibrator Training Pipeline (JSON)")
+    print("=" * 60)
+    feats, soft, hard = load_calibration_data(data_path)
+    n = len(soft)
+    print(f"Loaded {n} samples; pos_rate={hard.mean():.4f}")
+    print(f"Feature keys: {list(feats.keys())}")
+
+    # baseline
+    base_pred = np.clip(feats['draft_confidence'], 1e-6, 1 - 1e-6)
+    base_metrics = {
+        'brier': brier_score_loss(hard, base_pred),
+        'ece_eqfreq20': BaseCalibrator._compute_ece(base_pred, hard, None, 20, True),
+        'soft_mse': float(np.mean((base_pred - soft) ** 2)),
+        'auroc': roc_auc_score(hard, base_pred)
+    }
+    _print_metrics("BASELINE (draft_conf)", base_metrics)
+
+    # Platt
+    pl = PlattCalibrator(target='hard')
+    pl.fit(feats, soft, hard)
+    _print_metrics("PLATT (hard)", pl.evaluate(feats, soft, hard))
+
+    # Grouped Isotonic（硬标签）
+    gi = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard')
+    gi.fit(feats, soft, hard)
+    _print_metrics("Grouped Isotonic (hard)", gi.evaluate(feats, soft, hard))
+
+    # Monotonic（硬标签主导）
+    mono = MonotonicNetworkCalibrator(hidden_dim=32, n_basis=6, alpha_soft=0.0,
+                                      max_epochs=200, patience=20, device='cpu')
+    mono.fit(feats, soft, hard)
+    _print_metrics("Monotonic MLP (hard-dominant)", mono.evaluate(feats, soft, hard))
+
+    print("\n✓ Calibrator pipeline finished.")
+
+
+def compare_before_after_calibration():
+    set_seed(42)
+    data_path = "/root/Speculative_decoding/calibration_data/chartqa_train_40_val_0_test_60_total_100/non_calibrator/training_calibration_data.json"
+    feats, soft, hard = load_calibration_data(data_path)
+
+    base_pred = np.clip(feats['draft_confidence'], 1e-6, 1 - 1e-6)
+    print("\nBaseline Brier:", brier_score_loss(hard, base_pred))
+
+    pl = PlattCalibrator(target='hard'); pl.fit(feats, soft, hard)
+    gi = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard'); gi.fit(feats, soft, hard)
+    mono = MonotonicNetworkCalibrator(hidden_dim=32, n_basis=6, alpha_soft=0.0,
+                                      max_epochs=200, patience=20, device='cpu'); mono.fit(feats, soft, hard)
+
+    for name, cal in [("Platt", pl), ("Isotonic", gi), ("Monotonic", mono)]:
+        m = cal.evaluate(feats, soft, hard)
+        _print_metrics(name, m)
 
 
 if __name__ == "__main__":
     # test_calibrator_training()
     # compare_before_after_calibration()
     calibrator_path = "/root/Speculative_decoding/calibration_data/test_calibrators"
-    json_path = "/root/Speculative_decoding/calibration_data/mathverse_testmini_text_dominant_calib_monotonic_train_315_val_0_test_473_total_788/training_calibration_data.json"
+    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_1000_val_0_test_1500_total_2500/training_calibration_data.json"
     calibrator_training(calibrator_path, json_path)

@@ -6,6 +6,7 @@ import copy
 import os
 from tqdm import tqdm
 from datetime import timedelta
+import json
 
 from lmms_eval import utils
 from lmms_eval.api.instance import Instance
@@ -302,32 +303,39 @@ class Llava_MSD_Calibrated(lmms):
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
         
-        print(requests)
-        calibrator_mode = "isotonic"
+        # print(requests)
+        calibrator_mode = "isotonic" ## isotonic, monotonic
         # 数据分割配置
         total_samples = len(requests)
         train_ratio = 0  # 40% 用于训练
         val_ratio = 0    # 10% 用于验证
-        test_ratio = 0.6   # 50% 用于测试
+        test_ratio = 1   # 50% 用于测试
         
         train_end = int(total_samples * train_ratio)
         val_end = int(total_samples * (train_ratio + val_ratio))
-        
-        print(f"Data split: Train={train_end}, Val={val_end-train_end}, Test={total_samples-val_end}")
-        print(f"Total samples: {total_samples}")
 
         # 动态创建结果保存路径
         # 从requests中获取任务名称
         task_name = requests[0].task_name if requests else "unknown"
+        # FIX: 从第一个 request 的 arguments 元组中解出 gen_kwargs 并读取 temperature
+        try:
+            req0 = requests[0]
+            if hasattr(req0, "arguments") and isinstance(req0.arguments, tuple) and len(req0.arguments) >= 2 and isinstance(req0.arguments[1], dict):
+                temperature = req0.arguments[1].get("temperature", 0)
+            else:
+                temperature = 0
+        except Exception:
+            temperature = 0
+
         train_count = train_end
         val_count = val_end - train_end
         test_count = total_samples - val_end
         
         # 构建动态路径（新增校准器策略标识）
-        result_folder_name = f"{task_name}_calib_{calibrator_mode}_train_{train_count}_val_{val_count}_test_{test_count}_total_{total_samples}"
+        result_folder_name = f"{task_name}_calib_{calibrator_mode}_train_{train_count}_val_{val_count}_test_{test_count}_total_{total_samples}_temperature_{temperature}"
         base_calibration_path = f"/root/Speculative_decoding/calibration_data/{result_folder_name}"
         cross_attention_path = base_calibration_path
-
+    
         calibration_logger = get_calibration_logger(base_calibration_path)
 
         # 确保目录存在
@@ -342,18 +350,24 @@ class Llava_MSD_Calibrated(lmms):
         # 检查是否已存在训练好的校准器
         calibrator_dir = os.path.join(base_calibration_path, "calibrators")
         isotonic_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
-        
+        monotonic_path = os.path.join(calibrator_dir, "monotonic_network_calibrator.pkl")
+
         calibrator_trained = False
         trained_calibrators = {}
         
-        if os.path.exists(isotonic_path):
+        print(f"Isotonic path: {isotonic_path}")
+        print(f"Monotonic path: {monotonic_path}")
+        print(os.path.exists(isotonic_path))
+        print(os.path.exists(monotonic_path))
+        
+        if os.path.exists(isotonic_path) or os.path.exists(monotonic_path):
             print("\n" + "="*50)
             print("Found existing calibrators! Loading pre-trained calibrators...")
             print(f"  - Isotonic: {isotonic_path}")
             print("="*50)
             
             try:
-                trained_calibrators = self._load_existing_calibrators(isotonic_path)
+                trained_calibrators = self._load_existing_calibrators(isotonic_path, monotonic_path)
                 if trained_calibrators:
                     calibrator_trained = True
                     skip_to_test = True  # 已有校准器，直接跳到测试集
@@ -442,8 +456,7 @@ class Llava_MSD_Calibrated(lmms):
                     json_path = os.path.join(base_calibration_path, "training_calibration_data.json")
 
                     print(f"Starting calibrator_training with json: {json_path}")
-                    iso_cal = calibrator_training(calibrator_dir, json_path)
-                    mono_cal = None
+                    iso_cal, mono_cal = calibrator_training(calibrator_dir, json_path)
                     trained_calibrators = {'isotonic': iso_cal, 'monotonic': mono_cal}
                     calibrator_trained = True
                     print("Calibrator training completed and models saved.")
@@ -548,6 +561,7 @@ class Llava_MSD_Calibrated(lmms):
                     setattr(self.model, "acclen", 0)
                     setattr(self.model, "accnum", 0)
                     
+                    print(f"actual temperature {gen_kwargs['temperature']}")
                     # 传递inputs_embeds给msdgenerate，这样可以正确计算图像token位置
                     output_ids = self.model.msdgenerate(
                         input_ids, 
@@ -561,13 +575,16 @@ class Llava_MSD_Calibrated(lmms):
                         attention_masks_for_padding=attention_masks,
                         train_calibrator=train_calibrator_flag,
                         use_calibrator=use_calibrator,
-                        calibrator=trained_calibrators.get(calibrator_mode, None) if use_calibrator else None
-                        # calibrator=None
+                        # calibrator=trained_calibrators.get(calibrator_mode, None) if use_calibrator else None
+                        calibrator=None
                     ) 
                     
+                    print(f"actual temperature {gen_kwargs['temperature']}")
                     # accumulate overall stats
                     self.total_accept_len += int(getattr(self.model, "acclen", 0))
                     self.total_accept_steps += int(getattr(self.model, "accnum", 0))
+
+                    print(f"Average Acceptance Rate: {self.total_accept_len/self.total_accept_steps}")
                 else:
                     output_ids = self.model.naivegenerate(input_ids, inputs_embeds=inputs_embeds, temperature=gen_kwargs["temperature"], max_new_tokens=512)
                 cont = output_ids[:,input_ids.shape[1]:]
@@ -593,7 +610,7 @@ class Llava_MSD_Calibrated(lmms):
         pbar.close()
         
         if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
-            calibration_logger.save_data("test_calibration_data")
+            # calibration_logger.save_data("test_calibration_data")
             
             # 计算ECE并绘制图表 - 使用测试数据
             figure_save_path = os.path.join(base_calibration_path, "test_ece_bin_20.png")
@@ -611,8 +628,23 @@ class Llava_MSD_Calibrated(lmms):
                 eval_logger.info(f"  - Overall acceptance rate: {stats.get('overall_acceptance_rate', 'N/A'):.4f}")
                 eval_logger.info(f"  - Total samples: {stats.get('total_samples', 'N/A')}")
                 eval_logger.info(f"  - Figure saved to: {figure_save_path}")
-            
-            eval_logger.info("Test calibration data saved successfully")
+    
+                # 将总体接受率与样本数写入 base_calibration_path 下的 "acceptance rate" 文件
+                try:
+                    acceptance_file = os.path.join(base_calibration_path, "acceptance rate")
+                    acceptance_payload = {
+                        "average_acceptance_rate": float(stats.get("overall_acceptance_rate", 0.0)),
+                        "total_samples": int(stats.get("total_samples", 0)),
+                        "self.total_accept_len": self.total_accept_len,
+                        "self.total_accept_steps": self.total_accept_steps,
+                        "average_acc_per_step": self.total_accept_len / self.total_accept_steps
+                    }
+
+                    with open(acceptance_file, "w", encoding="utf-8") as f:
+                        json.dump(acceptance_payload, f, ensure_ascii=False, indent=2)
+                    eval_logger.info(f"  - Acceptance rate summary written to: {acceptance_file}")
+                except Exception as write_err:
+                    eval_logger.warning(f"Failed to write acceptance rate summary: {write_err}")
             
             # 生成跨模态注意力分析图表
             calibration_logger.plot_cross_modal_attention_comprehensive_analysis(
@@ -625,7 +657,7 @@ class Llava_MSD_Calibrated(lmms):
     def generate_until_multi_round(self, requests) -> List[str]:
         raise NotImplementedError("TODO: Implement multi-round generation for LLaVA_eagle")
 
-    def _load_existing_calibrators(self, isotonic_path):
+    def _load_existing_calibrators(self, isotonic_path, monotonic_path):
         """加载已存在的校准器"""
         import sys
         import pickle
@@ -639,27 +671,31 @@ class Llava_MSD_Calibrated(lmms):
         from eagle.model.calibrators import (
             GroupedIsotonicCalibrator,
             MonotonicNetworkCalibrator,
-            MonotonicMLP,
+            MonotonicMLP
         )
 
         # 自定义Unpickler以兼容历史pickle中的命名空间
         class _CalibratorUnpickler(pickle.Unpickler):
             def find_class(self, module, name):
-                # 统一映射三类对象（包含嵌套的MonotonicMLP）
+                # 同时兼容两种嵌套命名
+                affine_mono = getattr(MonotonicNetworkCalibrator, "_AffineMono", None) or getattr(MonotonicMLP, "_AffineMono", None)
                 mapping = {
                     "GroupedIsotonicCalibrator": GroupedIsotonicCalibrator,
                     "MonotonicNetworkCalibrator": MonotonicNetworkCalibrator,
                     "MonotonicMLP": MonotonicMLP,
+                    "_AffineMono": affine_mono,
+                    "MonotonicNetworkCalibrator._AffineMono": affine_mono,
+                    "MonotonicMLP._AffineMono": affine_mono,
                 }
-                # 旧命名空间兼容（lmms_eval.__main__ / __main__）
+                # 名称优先匹配（无论原始module为何）
+                if name in mapping and mapping[name] is not None:
+                    return mapping[name]
+                # 老命名空间也允许直接返回（双保险）
                 if name in mapping and module in (
                     "lmms_eval.__main__",
                     "__main__",
                     "eagle.model.calibrators",
                 ):
-                    return mapping[name]
-                # 名称匹配也直接返回
-                if name in mapping:
                     return mapping[name]
                 return super().find_class(module, name)
 
@@ -677,19 +713,32 @@ class Llava_MSD_Calibrated(lmms):
         except Exception as e:
             print(f"Error loading isotonic calibrator: {e}")
 
-        # # 加载单调网络校准器
-        # try:
-        #     print(f"Loading monotonic calibrator from: {monotonic_path}")
-        #     with open(monotonic_path, "rb") as f:
-        #         monotonic_cal = _CalibratorUnpickler(f).load()
-        #     if not isinstance(monotonic_cal, MonotonicNetworkCalibrator):
-        #         monotonic_cal = MonotonicNetworkCalibrator.load(monotonic_path)
-        #     trained_calibrators["monotonic"] = monotonic_cal
-        #     print("✓ Monotonic calibrator loaded successfully")
-        # except Exception as e:
-        #     print(f"Error loading monotonic calibrator: {e}")
+        # 加载单调网络校准器
+        try:
+            print(f"Loading monotonic calibrator from: {monotonic_path}")
+            # 加载单调网络校准器（增强容错）
+            try:
+                print(f"Loading monotonic calibrator from: {monotonic_path}")
+                with open(monotonic_path, "rb") as f:
+                    monotonic_cal = _CalibratorUnpickler(f).load()
+                if not isinstance(monotonic_cal, MonotonicNetworkCalibrator):
+                    monotonic_cal = MonotonicNetworkCalibrator.load(monotonic_path)
+                trained_calibrators["monotonic"] = monotonic_cal
+                print("✓ Monotonic calibrator loaded successfully")
+            except Exception as e:
+                print(f"Error loading monotonic calibrator with custom Unpickler: {e}")
+                # 回退：使用类方法的兼容加载
+                try:
+                    monotonic_cal = MonotonicNetworkCalibrator.load(monotonic_path)
+                    trained_calibrators["monotonic"] = monotonic_cal
+                    print("✓ Monotonic calibrator loaded successfully via classmethod fallback")
+                except Exception as e2:
+                    print(f"Error loading monotonic calibrator via classmethod fallback: {e2}")
 
-        # if trained_calibrators:
-        #     print(f"Successfully loaded {len(trained_calibrators)} calibrators")
+        except Exception as e:
+            print("Error loading monotonic calibrator")
+        
+        if trained_calibrators:
+            print(f"Successfully loaded {len(trained_calibrators)} calibrators")
         return trained_calibrators
 

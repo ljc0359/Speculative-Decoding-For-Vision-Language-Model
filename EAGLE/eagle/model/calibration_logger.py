@@ -1268,27 +1268,37 @@ class CalibrationLogger:
         # 计算总体acceptance rate (移到这里，在绘图之前)
         overall_acceptance_rate = float(np.mean(acceptance_labels))
         
-        # 创建confidence score bins
-        bin_boundaries = np.linspace(0, 1, num_bins + 1)
-        bin_indices = np.digitize(confidence_scores, bin_boundaries) - 1
-        bin_indices = np.clip(bin_indices, 0, num_bins - 1)
-        
-        # 计算每个bin的统计数据
-        bin_stats = {}
-        bin_confidences = []
-        bin_acceptance_rates = []
-        bin_counts = []
-        
-        for i in range(num_bins):
-            mask = bin_indices == i
-            if np.sum(mask) > 0:
-                bin_confidence = confidence_scores[mask]
-                bin_acceptance = acceptance_labels[mask]
-                
+        # 选择分箱方式：等频优先（根据你的数据偏斜情况更稳）
+        use_equal_frequency_confidence_bins = False  # 若需保留等宽，置为 False
+
+        if use_equal_frequency_confidence_bins:
+            # 等频分箱（按排序索引切片）
+            N = len(confidence_scores)
+            order = np.argsort(confidence_scores)
+            # 自适应：若样本数少于 num_bins，缩小分箱数量
+            actual_bins = min(num_bins, max(1, N))
+            idx_edges = np.linspace(0, N, actual_bins + 1).astype(int)
+
+            bin_stats = {}
+            bin_confidences = []
+            bin_acceptance_rates = []
+            bin_counts = []
+
+            # 量化边界用于展示（不是用于分箱）
+            bin_boundaries = np.quantile(confidence_scores, np.linspace(0, 1, actual_bins + 1)) if N > 0 else np.linspace(0, 1, actual_bins + 1)
+
+            for i in range(actual_bins):
+                start, end = idx_edges[i], idx_edges[i + 1]
+                if end <= start:
+                    continue
+                idx = order[start:end]
+                bin_confidence = confidence_scores[idx]
+                bin_acceptance = acceptance_labels[idx]
+
                 avg_confidence = float(np.mean(bin_confidence))
-                avg_acceptance = float(np.mean(bin_acceptance))  # 真正的token级别acceptance rate
-                count = int(np.sum(mask))
-                
+                avg_acceptance = float(np.mean(bin_acceptance))
+                count = int(len(idx))
+
                 bin_stats[f'bin_{i}'] = {
                     'bin_range': [float(bin_boundaries[i]), float(bin_boundaries[i+1])],
                     'count': count,
@@ -1297,19 +1307,51 @@ class CalibrationLogger:
                     'min_confidence': float(np.min(bin_confidence)),
                     'max_confidence': float(np.max(bin_confidence))
                 }
-                
+
                 bin_confidences.append(avg_confidence)
                 bin_acceptance_rates.append(avg_acceptance)
                 bin_counts.append(count)
-        
-        # 计算ECE (Expected Calibration Error)
+        else:
+            # 等宽分箱（原逻辑）
+            bin_boundaries = np.linspace(0, 1, num_bins + 1)
+            bin_indices = np.digitize(confidence_scores, bin_boundaries) - 1
+            bin_indices = np.clip(bin_indices, 0, num_bins - 1)
+
+            bin_stats = {}
+            bin_confidences = []
+            bin_acceptance_rates = []
+            bin_counts = []
+
+            for i in range(num_bins):
+                mask = bin_indices == i
+                if np.sum(mask) > 0:
+                    bin_confidence = confidence_scores[mask]
+                    bin_acceptance = acceptance_labels[mask]
+
+                    avg_confidence = float(np.mean(bin_confidence))
+                    avg_acceptance = float(np.mean(bin_acceptance))
+                    count = int(np.sum(mask))
+
+                    bin_stats[f'bin_{i}'] = {
+                        'bin_range': [float(bin_boundaries[i]), float(bin_boundaries[i+1])],
+                        'count': count,
+                        'avg_confidence': avg_confidence,
+                        'avg_acceptance_rate': avg_acceptance,
+                        'min_confidence': float(np.min(bin_confidence)),
+                        'max_confidence': float(np.max(bin_confidence))
+                    }
+
+                    bin_confidences.append(avg_confidence)
+                    bin_acceptance_rates.append(avg_acceptance)
+                    bin_counts.append(count)
+
+        # 计算 ECE（权重仍按每个 bin 的样本占比）
         bin_confidences = np.array(bin_confidences)
         bin_acceptance_rates = np.array(bin_acceptance_rates)
         bin_counts = np.array(bin_counts)
-        
         total_samples = np.sum(bin_counts)
-        ece = np.sum(bin_counts / total_samples * np.abs(bin_confidences - bin_acceptance_rates))
-        
+        ece = np.sum(bin_counts / total_samples * np.abs(bin_confidences - bin_acceptance_rates)) if total_samples > 0 else 0.0
+
         # 绘制原有的图表
         if save_figure and len(bin_confidences) > 0:
             plt.figure(figsize=(15, 6))

@@ -532,7 +532,7 @@ class Llava_MSD(lmms):
         # 在评估结束时保存calibration数据
         if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
             # 保存所有收集的calibration数据
-            calibration_logger.save_data("final_calibration_data")
+            # calibration_logger.save_data("final_calibration_data")
             
             # 计算ECE并绘制图表
             figure_save_path = "/root/Speculative_decoding/calibration_data/baseline_ece_bin_20.png"
