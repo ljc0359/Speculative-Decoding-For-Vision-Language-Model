@@ -777,7 +777,7 @@ class Model(nn.Module):
         return calibration_data
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=0.4):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=0.8):
         alpha = float(alpha)
         
         # === helper: compute per-candidate adaptive alpha in [0, alpha] ===
@@ -978,9 +978,90 @@ class Model(nn.Module):
         last_headout = head(last_hidden)
         last_p = self.logsoftmax(last_headout)
 
-        # ---------- 第 0 层 ----------
-        top = torch.topk(last_p, top_k, dim=-1)
-        topk_index, topk_p = top.indices, top.values
+        # ---------- 第 0 层：预选 top_k*2，校准融合（使用当前 alpha 形式），然后重排选最终 top_k ----------
+        preselect_k = 2 * top_k
+        pre_top = torch.topk(last_p, preselect_k, dim=-1)
+        preselect_index, preselect_p = pre_top.indices, pre_top.values  # [1, preselect_k]
+
+        layer_0_pre_data = None
+        if enable_candidate_calibration and base_model is not None:
+            if context_past_key_values is None:
+                raise RuntimeError("topK_genrate: context_past_key_values 为 None；请从 initialize_tree 传入初始化的 KVCache。")
+            preselect_layer_positions = torch.arange(1, 1 + preselect_k, device=preselect_index.device)
+            preselect_layer_depths = torch.ones(preselect_k, device=preselect_index.device)
+            preselect_layer_parents = torch.zeros(preselect_k, device=preselect_index.device)
+
+            layer_0_pre_data = self._collect_calibration_data_safely(
+                base_model=base_model,
+                original_context=input_ids.clone(),
+                inputs_embeds=inputs_embeds,
+                context_past_key_values=context_past_key_values,
+                topk_index=preselect_index,
+                topk_p=preselect_p,
+                layer_positions=preselect_layer_positions,
+                layer_depths=preselect_layer_depths,
+                layer_parents=preselect_layer_parents,
+                layer_idx=0,
+                attentions=attentions,
+                img_start_idx=img_start_idx,
+                img_end_idx=img_end_idx,
+                train_calibrator=train_calibrator
+            )
+            candidate_calibration_data.extend(layer_0_pre_data)
+
+        # 根据是否启用校准器决定最终 top_k 的选择
+        if use_calibrator and calibrator is not None and not train_calibrator and (layer_0_pre_data is not None):
+                try:
+                    import pandas as pd
+                    import numpy as np
+
+                    features_df = pd.DataFrame(layer_0_pre_data)
+                    calibrated_probs = calibrator.predict_proba(features_df)
+                    PROB_FLOOR = 1e-3
+                    calibrated_probs = np.clip(calibrated_probs, PROB_FLOOR, 1.0 - PROB_FLOOR)
+
+                    # 计算校准 logit 并裁剪，形状 [1, preselect_k]
+                    calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
+                    MAX_CALIB_LOGIT = 3.0
+                    calibrated_logits_np = np.clip(calibrated_logits_np, -MAX_CALIB_LOGIT, MAX_CALIB_LOGIT)
+                    calibrated_logits_tensor = torch.tensor(
+                        calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
+                    ).view(1, preselect_k)
+
+                    # 自适应 alpha，形状 [1, preselect_k]
+                    alpha_vec = _compute_adaptive_alpha(
+                        data_list=layer_0_pre_data,
+                        base_alpha=alpha,
+                        layer_idx=0,
+                        shape=(preselect_k,),
+                        device=preselect_p.device,
+                        dtype=preselect_p.dtype
+                    ).view(1, preselect_k)
+
+                    # 在原始 logits 上加性修正：bias = α_i * logit(p_accept_i)
+                    last_headout = last_headout.clone()
+                    bias_vec = alpha_vec * calibrated_logits_tensor
+                    last_headout.scatter_add_(dim=-1, index=preselect_index, src=bias_vec)
+
+                    # 重新计算 logsoftmax，并仅在预选集合内重排选出最终 top_k
+                    last_p = self.logsoftmax(last_headout)
+                    candidate_scores = last_p.gather(dim=-1, index=preselect_index)  # [1, preselect_k]
+                    reselect = torch.topk(candidate_scores, top_k, dim=-1)
+                    topk_index = preselect_index.gather(dim=-1, index=reselect.indices)
+                    topk_p = candidate_scores.gather(dim=-1, index=reselect.indices)
+
+                    if CALIBRATION_LOGGING_ENABLED:
+                        logger.log_calibrator_scores(0, preselect_p.view(-1), calibrated_logits_tensor.view(-1), candidate_scores.view(-1), preselect_k)
+                except Exception as e:
+                    print(f"[Calibrator] Error applying calibration in layer 0 (logits bias rerank): {e}")
+                    # 回退：直接在 last_p 上选 top_k
+                    top = torch.topk(last_p, top_k, dim=-1)
+                    topk_index, topk_p = top.indices, top.values
+        else:
+            # 不使用校准器：直接在 last_p 上选 top_k
+            top = torch.topk(last_p, top_k, dim=-1)
+            topk_index, topk_p = top.indices, top.values
+
         scores = topk_p[0]
         scores_list.append(scores[None])
 
@@ -1004,60 +1085,6 @@ class Model(nn.Module):
         next_position_idx += top_k
 
         frontier_paths = [[topk_index[0, p].item()] for p in range(top_k)]
-
-        layer_0_data = None
-        if enable_candidate_calibration and base_model is not None:
-            if context_past_key_values is None:
-                raise RuntimeError("topK_genrate: context_past_key_values 为 None；请从 initialize_tree 传入初始化的 KVCache。")
-            layer_0_data = self._collect_calibration_data_safely(
-                base_model=base_model,
-                original_context=input_ids.clone(),
-                inputs_embeds=inputs_embeds,
-                context_past_key_values=context_past_key_values,
-                topk_index=topk_index,
-                topk_p=topk_p,
-                layer_positions=layer_positions,
-                layer_depths=layer_depths,
-                layer_parents=layer_parents,
-                layer_idx=0,
-                attentions=attentions,
-                img_start_idx=img_start_idx,
-                img_end_idx=img_end_idx,
-                train_calibrator=train_calibrator
-            )
-            candidate_calibration_data.extend(layer_0_data)
-
-        # 自适应 alpha 融合（仅当采集到 layer_0_data）
-        if use_calibrator and calibrator is not None and not train_calibrator and (layer_0_data is not None):
-            try:
-                import pandas as pd
-                import numpy as np
-                
-                original_scores = scores.clone()
-
-                features_df = pd.DataFrame(layer_0_data)
-                calibrated_probs = calibrator.predict_proba(features_df)
-                calibrated_probs = np.clip(calibrated_probs, 1e-8, 1 - 1e-8)
-
-                # 计算自适应 alpha（shape = [top_k]）
-                alpha_vec = _compute_adaptive_alpha(
-                    data_list=layer_0_data,
-                    base_alpha=alpha,
-                    layer_idx=0,
-                    shape=(top_k,),
-                    device=scores.device,
-                    dtype=scores.dtype
-                )
-
-                calibrated_scores = torch.tensor(calibrated_probs, device=scores.device, dtype=scores.dtype)
-                # scores_new = (1 - α_i) * old + α_i * log(calib)
-                scores = scores * (1 - alpha_vec) + torch.log(calibrated_scores) * alpha_vec
-                scores_list[-1] = scores[None]
-
-                if CALIBRATION_LOGGING_ENABLED:
-                    logger.log_calibrator_scores(0, original_scores, calibrated_scores, scores, top_k)
-            except Exception as e:
-                print(f"[Calibrator] Error applying calibration in layer 0: {e}")
 
         parents_list.append(torch.zeros(1, dtype=torch.long, device=hidden_states.device))
         ss_token.append(topk_index)
@@ -1090,8 +1117,99 @@ class Model(nn.Module):
             last_headout = head(out_hidden[0])
             last_p = self.logsoftmax(last_headout)
 
-            top = torch.topk(last_p, top_k, dim=-1)
-            topk_index, topk_p = top.indices, top.values
+            preselect_k = 2 * top_k
+            pre_top = torch.topk(last_p, preselect_k, dim=-1)
+            preselect_index, preselect_p = pre_top.indices, pre_top.values  # [top_k, preselect_k]
+
+            layer_i_data = None
+            if enable_candidate_calibration and base_model is not None:
+                current_depth = i + 2
+                preselect_layer_positions = torch.arange(
+                    next_position_idx,
+                    next_position_idx + top_k * preselect_k,
+                    device=preselect_index.device
+                )
+                preselect_layer_depths = torch.full((top_k * preselect_k,), current_depth, device=preselect_index.device)
+
+                preselect_parent_positions_for_layer = []
+                for parent_idx in range(top_k):
+                    if i == 0:
+                        parent_pos = position_labels_list[0][parent_idx].item()
+                    else:
+                        parent_pos = next_position_idx - top_k * top_k + parent_idx * top_k
+                    preselect_parent_positions_for_layer.extend([parent_pos] * preselect_k)
+                preselect_layer_parents = torch.tensor(preselect_parent_positions_for_layer, device=preselect_index.device)
+
+                layer_i_data = self._collect_calibration_data_safely(
+                    base_model=base_model,
+                    original_context=input_ids.clone(),
+                    inputs_embeds=inputs_embeds,
+                    context_past_key_values=None,
+                    topk_index=preselect_index,
+                    topk_p=preselect_p,
+                    layer_positions=preselect_layer_positions,
+                    layer_depths=preselect_layer_depths,
+                    layer_parents=preselect_layer_parents,
+                    layer_idx=i + 1,
+                    frontier_paths=frontier_paths,
+                    attentions=layer_attentions,
+                    img_start_idx=img_start_idx,
+                    img_end_idx=img_end_idx,
+                    train_calibrator=train_calibrator
+                )
+                candidate_calibration_data.extend(layer_i_data)
+
+            # 校准融合 + 在预选集合内重排并选出最终 top_k
+            if use_calibrator and calibrator is not None and not train_calibrator and (layer_i_data is not None):
+                try:
+                    import pandas as pd
+                    import numpy as np
+                    features_df = pd.DataFrame(layer_i_data)
+                    calibrated_probs = calibrator.predict_proba(features_df)
+                    PROB_FLOOR = 1e-3
+                    calibrated_probs = np.clip(calibrated_probs, PROB_FLOOR, 1.0 - PROB_FLOOR)
+
+                    # 校准 logit 并裁剪，形状 [top_k, preselect_k]
+                    calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
+                    MAX_CALIB_LOGIT = 3.0
+                    calibrated_logits_np = np.clip(calibrated_logits_np, -MAX_CALIB_LOGIT, MAX_CALIB_LOGIT)
+                    calibrated_logits_tensor = torch.tensor(
+                        calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
+                    ).view(top_k, preselect_k)
+
+                    # 自适应 alpha，形状 [top_k, preselect_k]
+                    alpha_mat = _compute_adaptive_alpha(
+                        data_list=layer_i_data,
+                        base_alpha=alpha,
+                        layer_idx=i + 1,
+                        shape=(top_k, preselect_k),
+                        device=preselect_p.device,
+                        dtype=preselect_p.dtype
+                    ).view(top_k, preselect_k)
+
+                    # 对每个父节点的原始 logits 做加性修正
+                    last_headout = last_headout.clone()
+                    bias_mat = alpha_mat * calibrated_logits_tensor
+                    last_headout.scatter_add_(dim=-1, index=preselect_index, src=bias_mat)
+
+                    # 重新计算 logsoftmax，并在各自预选集合内重排选出最终 top_k
+                    last_p = self.logsoftmax(last_headout)
+                    candidate_scores = last_p.gather(dim=-1, index=preselect_index)  # [top_k, preselect_k]
+                    reselect = torch.topk(candidate_scores, top_k, dim=-1)
+                    topk_index = preselect_index.gather(dim=-1, index=reselect.indices)
+                    topk_p = candidate_scores.gather(dim=-1, index=reselect.indices)
+
+                    if CALIBRATION_LOGGING_ENABLED:
+                        logger.log_calibrator_scores(i + 1, preselect_p.view(-1), calibrated_logits_tensor.view(-1), candidate_scores.view(-1), top_k * preselect_k)
+                except Exception as e:
+                    print(f"[Calibrator] Error applying calibration in layer {i+1} (logits bias rerank): {e}")
+                    # 回退：直接在 last_p 上选 top_k
+                    top = torch.topk(last_p, top_k, dim=-1)
+                    topk_index, topk_p = top.indices, top.values
+            else:
+                # 不使用校准器：直接在 last_p 上选 top_k
+                top = torch.topk(last_p, top_k, dim=-1)
+                topk_index, topk_p = top.indices, top.values
 
             local_scores_list.append(topk_p)
             token_list.append(topk_index)
@@ -1112,60 +1230,6 @@ class Model(nn.Module):
             position_labels_list.append(layer_positions)
             depth_labels_list.append(layer_depths)
             parent_labels_list.append(layer_parents)
-
-            layer_i_data = None
-            if enable_candidate_calibration and base_model is not None:
-                layer_i_data = self._collect_calibration_data_safely(
-                    base_model=base_model,
-                    original_context=input_ids.clone(),
-                    inputs_embeds=inputs_embeds,
-                    context_past_key_values=None,
-                    topk_index=topk_index,
-                    topk_p=topk_p,
-                    layer_positions=layer_positions,
-                    layer_depths=layer_depths,
-                    layer_parents=layer_parents,
-                    layer_idx=i + 1,
-                    frontier_paths=frontier_paths,
-                    attentions=layer_attentions,
-                    img_start_idx=img_start_idx,
-                    img_end_idx=img_end_idx,
-                    train_calibrator=train_calibrator
-                )
-                candidate_calibration_data.extend(layer_i_data)
-
-            # 校准 + 自适应 alpha（仅当采集到 layer_i_data）
-            if use_calibrator and calibrator is not None and not train_calibrator and (layer_i_data is not None):
-                try:
-                    import pandas as pd
-                    original_topk_p = topk_p.clone()
-
-                    features_df = pd.DataFrame(layer_i_data)
-                    calibrated_probs = calibrator.predict_proba(features_df)
-                    calibrated_probs = np.clip(calibrated_probs, 1e-8, 1 - 1e-8)
-
-                    # 计算自适应 alpha（shape = [top_k, top_k]）
-                    alpha_mat = _compute_adaptive_alpha(
-                        data_list=layer_i_data,
-                        base_alpha=alpha,
-                        layer_idx=i + 1,
-                        shape=(top_k, top_k),
-                        device=topk_p.device,
-                        dtype=topk_p.dtype
-                    )
-
-                    calibrated_probs_tensor = torch.tensor(
-                        calibrated_probs, device=topk_p.device, dtype=topk_p.dtype
-                    ).view(top_k, top_k)
-
-                    # topk_p_new = (1 - α_ij)*old + α_ij*log(calib)
-                    topk_p = (1 - alpha_mat) * original_topk_p + alpha_mat * torch.log(calibrated_probs_tensor)
-                    local_scores_list[-1] = topk_p
-
-                    if CALIBRATION_LOGGING_ENABLED:
-                        logger.log_calibrator_scores(i + 1, original_topk_p.view(-1), calibrated_probs_tensor.view(-1), topk_p.view(-1), top_k * top_k)
-                except Exception as e:
-                    print(f"[Calibrator] Error applying calibration in layer {i+1}: {e}")
 
             cu_scores = topk_p + scores[:, None]
             topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)

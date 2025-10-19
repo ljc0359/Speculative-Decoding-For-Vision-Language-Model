@@ -304,7 +304,7 @@ class Llava_MSD_Calibrated(lmms):
         res = []
         
         # print(requests)
-        calibrator_mode = "isotonic" ## isotonic, monotonic
+        calibrator_mode = "monotonic" ## isotonic, monotonic
         # 数据分割配置
         total_samples = len(requests)
         train_ratio = 0  # 40% 用于训练
@@ -575,8 +575,8 @@ class Llava_MSD_Calibrated(lmms):
                         attention_masks_for_padding=attention_masks,
                         train_calibrator=train_calibrator_flag,
                         use_calibrator=use_calibrator,
-                        # calibrator=trained_calibrators.get(calibrator_mode, None) if use_calibrator else None
-                        calibrator=None
+                        calibrator=trained_calibrators.get(calibrator_mode, None) if use_calibrator else None
+                        # calibrator=None
                     ) 
                     
                     print(f"actual temperature {gen_kwargs['temperature']}")
