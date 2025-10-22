@@ -777,7 +777,7 @@ class Model(nn.Module):
         return calibration_data
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=0.8):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=1):
         alpha = float(alpha)
         
         # === helper: compute per-candidate adaptive alpha in [0, alpha] ===
@@ -853,9 +853,9 @@ class Model(nn.Module):
 
             # 组合：加权平均再乘微调；避免过激，最后整体缩放到 [0.2, 1.0]
             # 可调系数：margin 0.5, depth 0.3, attn 0.2
-            combo = (0.5 * margin_factor + 0.3 * depth_factor + 0.2 * attn_factor)
+            combo = (0.2 * margin_factor + 0.4 * depth_factor + 0.4 * attn_factor)
             combo = np.clip(combo * tok_boost, 0.0, 1.2)
-            combo = np.clip(combo, 0.2, 1.0)  # 保底 0.2，避免 alpha 过小无效
+            combo = np.clip(combo, 0.2, 1.0) 
 
             alpha_vec = base_alpha * combo  # 限制不超过全局 alpha
             alpha_t = torch.tensor(alpha_vec, device=device, dtype=dtype)
@@ -979,7 +979,7 @@ class Model(nn.Module):
         last_p = self.logsoftmax(last_headout)
 
         # ---------- 第 0 层：预选 top_k*2，校准融合（使用当前 alpha 形式），然后重排选最终 top_k ----------
-        preselect_k = 2 * top_k
+        preselect_k = 2 * top_k if not train_calibrator else top_k
         pre_top = torch.topk(last_p, preselect_k, dim=-1)
         preselect_index, preselect_p = pre_top.indices, pre_top.values  # [1, preselect_k]
 
@@ -1011,52 +1011,53 @@ class Model(nn.Module):
 
         # 根据是否启用校准器决定最终 top_k 的选择
         if use_calibrator and calibrator is not None and not train_calibrator and (layer_0_pre_data is not None):
-                try:
-                    import pandas as pd
-                    import numpy as np
+            try:
+                import pandas as pd
+                import numpy as np
 
-                    features_df = pd.DataFrame(layer_0_pre_data)
-                    calibrated_probs = calibrator.predict_proba(features_df)
-                    PROB_FLOOR = 1e-3
-                    calibrated_probs = np.clip(calibrated_probs, PROB_FLOOR, 1.0 - PROB_FLOOR)
+                features_df = pd.DataFrame(layer_0_pre_data)
+                calibrated_probs = calibrator.predict_proba(features_df)
+                PROB_FLOOR = 1e-3
+                calibrated_probs = np.clip(calibrated_probs, PROB_FLOOR, 1.0 - PROB_FLOOR)
 
-                    # 计算校准 logit 并裁剪，形状 [1, preselect_k]
-                    calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
-                    MAX_CALIB_LOGIT = 3.0
-                    calibrated_logits_np = np.clip(calibrated_logits_np, -MAX_CALIB_LOGIT, MAX_CALIB_LOGIT)
-                    calibrated_logits_tensor = torch.tensor(
-                        calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
-                    ).view(1, preselect_k)
+                # 计算校准 logit 并裁剪，形状 [1, preselect_k]
+                calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
+                NEG_MAX_CALIB_LOGIT = 5.0
+                POS_MAX_CALIB_LOGIT = 5.0
+                calibrated_logits_np = np.clip(calibrated_logits_np, -NEG_MAX_CALIB_LOGIT, POS_MAX_CALIB_LOGIT)
+                calibrated_logits_tensor = torch.tensor(
+                    calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
+                ).view(1, preselect_k)
 
-                    # 自适应 alpha，形状 [1, preselect_k]
-                    alpha_vec = _compute_adaptive_alpha(
-                        data_list=layer_0_pre_data,
-                        base_alpha=alpha,
-                        layer_idx=0,
-                        shape=(preselect_k,),
-                        device=preselect_p.device,
-                        dtype=preselect_p.dtype
-                    ).view(1, preselect_k)
+                # 自适应 alpha，形状 [1, preselect_k]
+                alpha_vec = _compute_adaptive_alpha(
+                    data_list=layer_0_pre_data,
+                    base_alpha=alpha,
+                    layer_idx=0,
+                    shape=(preselect_k,),
+                    device=preselect_p.device,
+                    dtype=preselect_p.dtype
+                ).view(1, preselect_k)
 
-                    # 在原始 logits 上加性修正：bias = α_i * logit(p_accept_i)
-                    last_headout = last_headout.clone()
-                    bias_vec = alpha_vec * calibrated_logits_tensor
-                    last_headout.scatter_add_(dim=-1, index=preselect_index, src=bias_vec)
+                # 在原始 logits 上加性修正：bias = α_i * logit(p_accept_i)
+                last_headout = last_headout.clone()
+                bias_vec = alpha_vec * calibrated_logits_tensor
+                last_headout.scatter_add_(dim=-1, index=preselect_index, src=bias_vec)
 
-                    # 重新计算 logsoftmax，并仅在预选集合内重排选出最终 top_k
-                    last_p = self.logsoftmax(last_headout)
-                    candidate_scores = last_p.gather(dim=-1, index=preselect_index)  # [1, preselect_k]
-                    reselect = torch.topk(candidate_scores, top_k, dim=-1)
-                    topk_index = preselect_index.gather(dim=-1, index=reselect.indices)
-                    topk_p = candidate_scores.gather(dim=-1, index=reselect.indices)
+                # 重新计算 logsoftmax，并仅在预选集合内重排选出最终 top_k
+                last_p = self.logsoftmax(last_headout)
+                candidate_scores = last_p.gather(dim=-1, index=preselect_index)  # [1, preselect_k]
+                reselect = torch.topk(candidate_scores, top_k, dim=-1)
+                topk_index = preselect_index.gather(dim=-1, index=reselect.indices)
+                topk_p = candidate_scores.gather(dim=-1, index=reselect.indices)
 
-                    if CALIBRATION_LOGGING_ENABLED:
-                        logger.log_calibrator_scores(0, preselect_p.view(-1), calibrated_logits_tensor.view(-1), candidate_scores.view(-1), preselect_k)
-                except Exception as e:
-                    print(f"[Calibrator] Error applying calibration in layer 0 (logits bias rerank): {e}")
-                    # 回退：直接在 last_p 上选 top_k
-                    top = torch.topk(last_p, top_k, dim=-1)
-                    topk_index, topk_p = top.indices, top.values
+                if CALIBRATION_LOGGING_ENABLED:
+                    logger.log_calibrator_scores(0, preselect_p.view(-1), calibrated_logits_tensor.view(-1), candidate_scores.view(-1), preselect_k)
+            except Exception as e:
+                print(f"[Calibrator] Error applying calibration in layer 0 (logits bias rerank): {e}")
+                # 回退：直接在 last_p 上选 top_k
+                top = torch.topk(last_p, top_k, dim=-1)
+                topk_index, topk_p = top.indices, top.values
         else:
             # 不使用校准器：直接在 last_p 上选 top_k
             top = torch.topk(last_p, top_k, dim=-1)
@@ -1117,7 +1118,7 @@ class Model(nn.Module):
             last_headout = head(out_hidden[0])
             last_p = self.logsoftmax(last_headout)
 
-            preselect_k = 2 * top_k
+            preselect_k = 2 * top_k if not train_calibrator else top_k
             pre_top = torch.topk(last_p, preselect_k, dim=-1)
             preselect_index, preselect_p = pre_top.indices, pre_top.values  # [top_k, preselect_k]
 
@@ -1171,8 +1172,9 @@ class Model(nn.Module):
 
                     # 校准 logit 并裁剪，形状 [top_k, preselect_k]
                     calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
-                    MAX_CALIB_LOGIT = 3.0
-                    calibrated_logits_np = np.clip(calibrated_logits_np, -MAX_CALIB_LOGIT, MAX_CALIB_LOGIT)
+                    NEG_MAX_CALIB_LOGIT = 5.0
+                    POS_MAX_CALIB_LOGIT = 5.0
+                    calibrated_logits_np = np.clip(calibrated_logits_np, -NEG_MAX_CALIB_LOGIT, POS_MAX_CALIB_LOGIT)
                     calibrated_logits_tensor = torch.tensor(
                         calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
                     ).view(top_k, preselect_k)

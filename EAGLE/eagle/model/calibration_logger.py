@@ -1371,15 +1371,10 @@ class CalibrationLogger:
                           width=bin_width * 0.8, alpha=0.7, color='steelblue', 
                           edgecolor='navy', linewidth=1, label='Observed Acceptance Rate')
             
-            # 在每个条形上方显示样本数量
-            for i, (center, rate, count) in enumerate(zip(bin_centers[:len(bin_acceptance_rates)], 
-                                                            bin_acceptance_rates, bin_counts)):
-                plt.text(center, rate + 0.02, f'{count}', ha='center', va='bottom', 
-                        fontsize=9, fontweight='bold')
             
             plt.xlabel('Confidence Score', fontsize=12, fontweight='bold')
             plt.ylabel('Token Acceptance Rate', fontsize=12, fontweight='bold')
-            plt.title(f'Token-level Calibration\n(ECE: {ece:.4f})', fontsize=14, fontweight='bold')
+            plt.title('Token-level Calibration', fontsize=14, fontweight='bold')
             plt.legend(loc='upper left', fontsize=10)
             plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
             plt.xlim(-0.05, 1.05)
@@ -1395,10 +1390,6 @@ class CalibrationLogger:
                            width=bin_width * 0.8, alpha=0.7, color='lightgreen', 
                            edgecolor='darkgreen', linewidth=1)
             
-            # 在每个条形上方显示数量
-            for center, count in zip(bin_centers[:len(bin_counts)], bin_counts):
-                plt.text(center, count + max(bin_counts) * 0.01, f'{count}', 
-                        ha='center', va='bottom', fontsize=9, fontweight='bold')
             
             plt.xlabel('Confidence Score', fontsize=12, fontweight='bold')
             plt.ylabel('Token Count', fontsize=12, fontweight='bold')

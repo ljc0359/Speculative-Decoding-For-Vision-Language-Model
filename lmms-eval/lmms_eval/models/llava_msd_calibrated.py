@@ -304,7 +304,7 @@ class Llava_MSD_Calibrated(lmms):
         res = []
         
         # print(requests)
-        calibrator_mode = "monotonic" ## isotonic, monotonic
+        calibrator_mode = "isotonic" ## isotonic, monotonic
         # 数据分割配置
         total_samples = len(requests)
         train_ratio = 0  # 40% 用于训练
@@ -409,6 +409,8 @@ class Llava_MSD_Calibrated(lmms):
         
         chunks_list = list(chunks)
         
+        reset_flag=False
+
         for chunk_idx, chunk in enumerate(chunks_list):
             # 确定当前chunk属于哪个数据集
 
@@ -419,6 +421,7 @@ class Llava_MSD_Calibrated(lmms):
 
             current_sample_idx = chunk_idx  # 假设batch_size=1
             
+            
             if current_sample_idx < train_end and not skip_to_test:
                 data_phase = "train"
                 train_calibrator_flag = True
@@ -428,6 +431,12 @@ class Llava_MSD_Calibrated(lmms):
                 train_calibrator_flag = False
                 use_calibrator = calibrator_trained  # 验证阶段使用已训练的校准器
             else:
+                ## reset accept len and steps after training
+                if not reset_flag:
+                    self.total_accept_len = 0
+                    self.total_accept_steps = 0
+                    reset_flag = True
+
                 data_phase = "test"
                 train_calibrator_flag = False
                 use_calibrator = calibrator_trained  # 测试阶段使用已训练的校准器
