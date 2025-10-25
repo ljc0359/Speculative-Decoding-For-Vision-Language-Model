@@ -666,7 +666,7 @@ class Llava_MSD_Calibrated(lmms):
     def generate_until_multi_round(self, requests) -> List[str]:
         raise NotImplementedError("TODO: Implement multi-round generation for LLaVA_eagle")
 
-    def _load_existing_calibrators(self, isotonic_path, monotonic_path):
+    def _load_existing_calibrators(self, isotonic_path, monotonic_path=None):
         """加载已存在的校准器"""
         import sys
         import pickle
@@ -676,25 +676,14 @@ class Llava_MSD_Calibrated(lmms):
         if eagle_path not in sys.path:
             sys.path.append(eagle_path)
 
-        # 导入校准器类与嵌套的单调网络模型类
-        from eagle.model.calibrators import (
-            GroupedIsotonicCalibrator,
-            MonotonicNetworkCalibrator,
-            MonotonicMLP
-        )
+        # 导入校准器类
+        from eagle.model.calibrators import GroupedIsotonicCalibrator
 
         # 自定义Unpickler以兼容历史pickle中的命名空间
         class _CalibratorUnpickler(pickle.Unpickler):
             def find_class(self, module, name):
-                # 同时兼容两种嵌套命名
-                affine_mono = getattr(MonotonicNetworkCalibrator, "_AffineMono", None) or getattr(MonotonicMLP, "_AffineMono", None)
                 mapping = {
                     "GroupedIsotonicCalibrator": GroupedIsotonicCalibrator,
-                    "MonotonicNetworkCalibrator": MonotonicNetworkCalibrator,
-                    "MonotonicMLP": MonotonicMLP,
-                    "_AffineMono": affine_mono,
-                    "MonotonicNetworkCalibrator._AffineMono": affine_mono,
-                    "MonotonicMLP._AffineMono": affine_mono,
                 }
                 # 名称优先匹配（无论原始module为何）
                 if name in mapping and mapping[name] is not None:
@@ -721,31 +710,6 @@ class Llava_MSD_Calibrated(lmms):
             print("✓ Isotonic calibrator loaded successfully")
         except Exception as e:
             print(f"Error loading isotonic calibrator: {e}")
-
-        # 加载单调网络校准器
-        try:
-            print(f"Loading monotonic calibrator from: {monotonic_path}")
-            # 加载单调网络校准器（增强容错）
-            try:
-                print(f"Loading monotonic calibrator from: {monotonic_path}")
-                with open(monotonic_path, "rb") as f:
-                    monotonic_cal = _CalibratorUnpickler(f).load()
-                if not isinstance(monotonic_cal, MonotonicNetworkCalibrator):
-                    monotonic_cal = MonotonicNetworkCalibrator.load(monotonic_path)
-                trained_calibrators["monotonic"] = monotonic_cal
-                print("✓ Monotonic calibrator loaded successfully")
-            except Exception as e:
-                print(f"Error loading monotonic calibrator with custom Unpickler: {e}")
-                # 回退：使用类方法的兼容加载
-                try:
-                    monotonic_cal = MonotonicNetworkCalibrator.load(monotonic_path)
-                    trained_calibrators["monotonic"] = monotonic_cal
-                    print("✓ Monotonic calibrator loaded successfully via classmethod fallback")
-                except Exception as e2:
-                    print(f"Error loading monotonic calibrator via classmethod fallback: {e2}")
-
-        except Exception as e:
-            print("Error loading monotonic calibrator")
         
         if trained_calibrators:
             print(f"Successfully loaded {len(trained_calibrators)} calibrators")

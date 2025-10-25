@@ -777,11 +777,11 @@ class Model(nn.Module):
         return calibration_data
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=1):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=1, if_adaptive=True):
         alpha = float(alpha)
         
         # === helper: compute per-candidate adaptive alpha in [0, alpha] ===
-        def _compute_adaptive_alpha(data_list, base_alpha: float, layer_idx: int, shape=None, device=None, dtype=None):
+        def _compute_adaptive_alpha(data_list, base_alpha: float, layer_idx: int, shape=None, device=None, dtype=None, if_adaptive=True):
             """
             data_list: list[dict] from _collect_calibration_data_safely
             返回与候选同形状的 alpha 向量（或矩阵，对 layer_i 是 top_k*top_k）
@@ -790,9 +790,16 @@ class Model(nn.Module):
             - depth 越深  -> 越依赖校准（alpha↑）
             - 注意力越弱  -> 越依赖校准（alpha↑）
             - token_category == 'number' 小幅增加（经验启发）
+            - draft_confidence 高段时，对 alpha 进行门控收缩，避免过度放大校准器偏置
+            
+            if_adaptive: 如果为False，所有token都使用全局base_alpha
             """
             if (shape is None) or (device is None) or (dtype is None):
                 raise RuntimeError("adaptive alpha: shape/device/dtype must be provided")
+
+            # 如果禁用自适应，直接返回全局alpha
+            if not if_adaptive:
+                return torch.full(shape, base_alpha, device=device, dtype=dtype)
 
             # 默认：全部用 base_alpha（保证健壮）
             if not data_list:
@@ -804,6 +811,8 @@ class Model(nn.Module):
             depth_arr    = np.array([d.get('tree_depth', d.get('layer', np.nan)) for d in data_list], dtype=np.float64)
             attn_arr     = np.array([d.get('avg_visual_attention_intensity', np.nan) for d in data_list], dtype=np.float64)
             token_cat    = [d.get('token_category', None) for d in data_list]
+            # 新增：draft_confidence，用于高段 alpha 门控收缩
+            conf_arr     = np.array([d.get('draft_confidence', np.nan) for d in data_list], dtype=np.float64)
 
             n = len(data_list)
 
@@ -851,13 +860,24 @@ class Model(nn.Module):
                 else:
                     tok_boost[i] = 1.00
 
-            # 组合：加权平均再乘微调；避免过激，最后整体缩放到 [0.2, 1.0]
-            # 可调系数：margin 0.5, depth 0.3, attn 0.2
+            # 组合：加权平均再乘微调；避免过激，整体缩放到 [0.2, 0.8]
             combo = (0.2 * margin_factor + 0.4 * depth_factor + 0.4 * attn_factor)
             combo = np.clip(combo * tok_boost, 0.0, 1.2)
-            combo = np.clip(combo, 0.2, 1.0) 
+            combo = np.clip(combo, 0.2, 0.8)
 
-            alpha_vec = base_alpha * combo  # 限制不超过全局 alpha
+            # 高段 alpha 门控收缩（平滑 sigmoidal）
+            CONF_HIGH_THRESHOLD = 0.68
+            GATE_SMOOTH_K = 18.0
+            HIGH_CONF_ALPHA_SHRINK = 0.5  # 最高收缩 50%
+            if np.isnan(conf_arr).all():
+                conf_arr[:] = CONF_HIGH_THRESHOLD
+            else:
+                c_med = np.nanmedian(conf_arr)
+                conf_arr = np.where(np.isnan(conf_arr), c_med, conf_arr)
+            gate = 1.0 / (1.0 + np.exp(-GATE_SMOOTH_K * (conf_arr - CONF_HIGH_THRESHOLD)))  # [0,1]
+            shrink = 1.0 - HIGH_CONF_ALPHA_SHRINK * gate
+
+            alpha_vec = base_alpha * combo * shrink  # 限制不超过全局 alpha
             alpha_t = torch.tensor(alpha_vec, device=device, dtype=dtype)
             if len(shape) == 2:
                 # layer_i: 需要 reshape 成 [top_k, top_k]
@@ -1023,7 +1043,7 @@ class Model(nn.Module):
                 # 计算校准 logit 并裁剪，形状 [1, preselect_k]
                 calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
                 NEG_MAX_CALIB_LOGIT = 5.0
-                POS_MAX_CALIB_LOGIT = 5.0
+                POS_MAX_CALIB_LOGIT = 1.5
                 calibrated_logits_np = np.clip(calibrated_logits_np, -NEG_MAX_CALIB_LOGIT, POS_MAX_CALIB_LOGIT)
                 calibrated_logits_tensor = torch.tensor(
                     calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
@@ -1036,7 +1056,8 @@ class Model(nn.Module):
                     layer_idx=0,
                     shape=(preselect_k,),
                     device=preselect_p.device,
-                    dtype=preselect_p.dtype
+                    dtype=preselect_p.dtype,
+                    if_adaptive=if_adaptive
                 ).view(1, preselect_k)
 
                 # 在原始 logits 上加性修正：bias = α_i * logit(p_accept_i)
@@ -1173,7 +1194,7 @@ class Model(nn.Module):
                     # 校准 logit 并裁剪，形状 [top_k, preselect_k]
                     calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
                     NEG_MAX_CALIB_LOGIT = 5.0
-                    POS_MAX_CALIB_LOGIT = 5.0
+                    POS_MAX_CALIB_LOGIT = 1.5
                     calibrated_logits_np = np.clip(calibrated_logits_np, -NEG_MAX_CALIB_LOGIT, POS_MAX_CALIB_LOGIT)
                     calibrated_logits_tensor = torch.tensor(
                         calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
@@ -1186,7 +1207,8 @@ class Model(nn.Module):
                         layer_idx=i + 1,
                         shape=(top_k, preselect_k),
                         device=preselect_p.device,
-                        dtype=preselect_p.dtype
+                        dtype=preselect_p.dtype,
+                        if_adaptive=if_adaptive
                     ).view(top_k, preselect_k)
 
                     # 对每个父节点的原始 logits 做加性修正

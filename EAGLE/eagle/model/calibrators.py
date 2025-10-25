@@ -109,6 +109,9 @@ class BaseCalibrator(ABC):
     def _create_group_key(self, token_type: int, attn_q: int, pos_bin: int) -> str:
         return f"t{token_type}_a{attn_q}_p{pos_bin}"
 
+    def _create_group_key2(self, token_type: int, attn_q: int) -> str:
+        return f"t{token_type}_a{attn_q}"
+        
     def _create_group_key4(self, token_type: int, attn_q: int, pos_bin: int, margin_q: int) -> str:
         # 新增的四维键：token_type × attn_q × pos_bin × margin_q
         return f"t{token_type}_a{attn_q}_p{pos_bin}_m{margin_q}"
@@ -249,46 +252,336 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
 
     def __init__(self, min_samples_per_group: int = 200,
                  out_of_bounds: str = 'clip',
-                 target: str = 'hard'):
+                 target: str = 'hard',
+                 use_adaptive_params: bool = False,
+                 use_hybrid_grouping: bool = True,
+                 confidence_threshold: float = 0.6,
+                 use_temperature_scaling: bool = True,
+                 temperature_range: tuple = (1.2, 2.0)):
         super().__init__()
         self.min_samples_per_group = min_samples_per_group
         self.out_of_bounds = out_of_bounds
         self.target = target  # 'hard' or 'soft'
-        self.level1, self.level2, self.level3 = {}, {}, {}
+        self.use_adaptive_params = use_adaptive_params  # 动态校准参数开关
+        self.use_hybrid_grouping = use_hybrid_grouping  # 混合分组策略开关
+        self.confidence_threshold = confidence_threshold  # 高低置信度分组阈值
+        self.use_temperature_scaling = use_temperature_scaling  # 温度缩放开关
+        self.temperature_range = temperature_range  # 温度缩放范围
+        
+        # 四层分组存储（低置信度使用）
+        self.level1, self.level2, self.level3, self.level4 = {}, {}, {}, {}
+        # 两层分组存储（高置信度使用）
+        self.high_conf_level1, self.high_conf_level2 = {}, {}
+        
+        # 温度缩放参数存储
+        self.temperature_params = {}
+        
         self.global_calibrator = None
         self.global_mean = None
+        
+        # 静态参数（当use_adaptive_params=False时使用）
+        self.static_tail_wrong_boost = 2.0
+        self.static_tail_shrink_alpha = 0.5
+        self.static_tail_conf_threshold = 0.75
+
+    def _compute_overconfidence_metrics(self, x, y, w=None):
+        """
+        计算组内过度自信程度的量化指标
+        
+        Returns:
+            dict: 包含各种过度自信指标的字典
+        """
+        if len(x) == 0:
+            return {"overconf_ratio": 0.0, "high_conf_error_rate": 0.0, "calibration_gap": 0.0}
+        
+        # 1. 过度自信比例：高置信度但错误的样本占比
+        high_conf_mask = x >= 0.7  # 高置信度阈值
+        if high_conf_mask.sum() == 0:
+            high_conf_error_rate = 0.0
+            overconf_ratio = 0.0
+        else:
+            high_conf_errors = (high_conf_mask & (y < 0.5)).sum()
+            high_conf_total = high_conf_mask.sum()
+            high_conf_error_rate = float(high_conf_errors / high_conf_total)
+            overconf_ratio = float(high_conf_errors / len(x))
+        
+        # 2. 校准差距：置信度与准确率的最大偏差
+        # 将置信度分为5个区间，计算每个区间的校准差距
+        conf_bins = np.linspace(0, 1, 6)  # [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        max_gap = 0.0
+        
+        for i in range(len(conf_bins) - 1):
+            bin_mask = (x >= conf_bins[i]) & (x < conf_bins[i + 1])
+            if i == len(conf_bins) - 2:  # 最后一个区间包含右端点
+                bin_mask = (x >= conf_bins[i]) & (x <= conf_bins[i + 1])
+            
+            if bin_mask.sum() > 0:
+                if w is not None:
+                    bin_conf = float(np.average(x[bin_mask], weights=w[bin_mask]))
+                    bin_acc = float(np.average(y[bin_mask], weights=w[bin_mask]))
+                else:
+                    bin_conf = float(np.mean(x[bin_mask]))
+                    bin_acc = float(np.mean(y[bin_mask]))
+                
+                gap = abs(bin_conf - bin_acc)
+                max_gap = max(max_gap, gap)
+        
+        # 3. 尾段过度自信强度：0.8+区间的平均校准偏差
+        tail_mask = x >= 0.8
+        if tail_mask.sum() > 0:
+            if w is not None:
+                tail_conf = float(np.average(x[tail_mask], weights=w[tail_mask]))
+                tail_acc = float(np.average(y[tail_mask], weights=w[tail_mask]))
+            else:
+                tail_conf = float(np.mean(x[tail_mask]))
+                tail_acc = float(np.mean(y[tail_mask]))
+            tail_overconf = max(0.0, tail_conf - tail_acc)
+        else:
+            tail_overconf = 0.0
+        
+        return {
+            "overconf_ratio": overconf_ratio,
+            "high_conf_error_rate": high_conf_error_rate, 
+            "calibration_gap": max_gap,
+            "tail_overconf": tail_overconf
+        }
+
+    def _compute_adaptive_params(self, overconf_metrics):
+        """
+        基于过度自信指标动态计算校准参数
+        
+        Args:
+            overconf_metrics: _compute_overconfidence_metrics的输出
+            
+        Returns:
+            dict: 自适应的校准参数
+        """
+        # 基础参数
+        base_wrong_boost = 2.0
+        base_shrink_alpha = 0.5
+        base_threshold = 0.75
+        
+        # 根据过度自信程度动态调整
+        overconf_ratio = overconf_metrics["overconf_ratio"]
+        high_conf_error_rate = overconf_metrics["high_conf_error_rate"]
+        calibration_gap = overconf_metrics["calibration_gap"]
+        tail_overconf = overconf_metrics["tail_overconf"]
+        
+        # 1. 动态错误权重提升系数
+        # 过度自信越严重，错误样本权重提升越大
+        boost_multiplier = 1.0 + 3.0 * overconf_ratio + 2.0 * high_conf_error_rate
+        adaptive_wrong_boost = base_wrong_boost * boost_multiplier
+        adaptive_wrong_boost = min(adaptive_wrong_boost, 5.0)  # 上限保护
+        
+        # 2. 动态先验收缩强度
+        # 校准差距越大，收缩越强
+        shrink_multiplier = 1.0 + 1.5 * calibration_gap + 2.0 * tail_overconf
+        adaptive_shrink_alpha = base_shrink_alpha * shrink_multiplier
+        adaptive_shrink_alpha = min(adaptive_shrink_alpha, 0.8)  # 上限保护
+        
+        # 3. 动态置信度阈值
+        # 如果尾段过度自信严重，降低阈值以扩大校准范围
+        threshold_adjustment = -0.1 * tail_overconf
+        adaptive_threshold = base_threshold + threshold_adjustment
+        adaptive_threshold = max(adaptive_threshold, 0.6)  # 下限保护
+        
+        return {
+            "tail_wrong_boost": adaptive_wrong_boost,
+            "tail_shrink_alpha": adaptive_shrink_alpha,
+            "tail_conf_threshold": adaptive_threshold,
+            "boost_multiplier": boost_multiplier,
+            "shrink_multiplier": shrink_multiplier
+        }
+    
+    def _compute_temperature_scaling(self, confidences, labels, group_key="global"):
+        """
+        计算温度缩放参数来解决过度自信问题
+        
+        Args:
+            confidences: 置信度数组
+            labels: 真实标签数组  
+            group_key: 分组键，用于存储不同组的温度参数
+            
+        Returns:
+            optimal_temperature: 最优温度参数
+        """
+        if not self.use_temperature_scaling:
+            return 1.0
+            
+        confidences = np.array(confidences)
+        labels = np.array(labels)
+        
+        # 过滤掉极端值
+        valid_mask = (confidences > 1e-6) & (confidences < 1 - 1e-6)
+        if np.sum(valid_mask) < 10:  # 样本太少，不进行温度缩放
+            return 1.0
+            
+        confidences = confidences[valid_mask]
+        labels = labels[valid_mask]
+        
+        def temperature_loss(temperature):
+            """温度缩放损失函数（负对数似然）"""
+            temp_confidences = self._apply_temperature_scaling(confidences, temperature)
+            # 避免log(0)
+            temp_confidences = np.clip(temp_confidences, 1e-7, 1 - 1e-7)
+            
+            # 负对数似然损失
+            loss = -np.mean(labels * np.log(temp_confidences) + 
+                           (1 - labels) * np.log(1 - temp_confidences))
+            return loss
+        
+        # 在指定范围内搜索最优温度
+        from scipy.optimize import minimize_scalar
+        
+        result = minimize_scalar(
+            temperature_loss,
+            bounds=self.temperature_range,
+            method='bounded'
+        )
+        
+        optimal_temp = result.x if result.success else 1.0
+        
+        # 存储温度参数
+        self.temperature_params[group_key] = optimal_temp
+        
+        return optimal_temp
+    
+    def _apply_temperature_scaling(self, confidences, temperature):
+        """
+        应用温度缩放
+        
+        Args:
+            confidences: 原始置信度
+            temperature: 温度参数
+            
+        Returns:
+            scaled_confidences: 缩放后的置信度
+        """
+        if temperature == 1.0:
+            return confidences
+            
+        # 将置信度转换为logits
+        confidences = np.clip(confidences, 1e-7, 1 - 1e-7)
+        logits = np.log(confidences / (1 - confidences))
+        
+        # 应用温度缩放
+        scaled_logits = logits / temperature
+        
+        # 转换回置信度
+        scaled_confidences = 1 / (1 + np.exp(-scaled_logits))
+        
+        return scaled_confidences
 
     def _fit_iso_binned(self, x, y, w=None, n_bins: int = 20):
         s = np.argsort(x)
         xs, ys = x[s], y[s]
         ws = w[s] if w is not None else None
-        # 等频分桶
-        edges = np.linspace(0, len(xs), n_bins + 1).astype(int)
+
+        # ========= 校准参数设置 =========
+        if self.use_adaptive_params:
+            # 动态参数计算
+            # 1. 计算组内过度自信指标
+            overconf_metrics = self._compute_overconfidence_metrics(xs, ys, ws)
+            
+            # 2. 基于指标动态调整校准参数
+            adaptive_params = self._compute_adaptive_params(overconf_metrics)
+            
+            # 3. 应用自适应参数
+            self.adaptive_bins = True
+            self.max_bins = 20
+            self.min_bin_size = 50
+            self.tail_conf_threshold = adaptive_params["tail_conf_threshold"]
+            self.tail_gate_k = 10.0  # 保持固定
+            self.tail_wrong_boost = adaptive_params["tail_wrong_boost"]
+            self.tail_shrink_alpha = adaptive_params["tail_shrink_alpha"]
+            
+            # 可选：打印调试信息（仅在样本数足够时）
+            if len(xs) >= 100:  # 避免小样本组的噪声输出
+                print(f"    [自适应校准] 样本数={len(xs)}, "
+                      f"过度自信比例={overconf_metrics['overconf_ratio']:.3f}, "
+                      f"高置信错误率={overconf_metrics['high_conf_error_rate']:.3f}, "
+                      f"校准差距={overconf_metrics['calibration_gap']:.3f}")
+                print(f"    [参数调整] wrong_boost={self.tail_wrong_boost:.2f}(×{adaptive_params['boost_multiplier']:.2f}), "
+                      f"shrink_alpha={self.tail_shrink_alpha:.2f}(×{adaptive_params['shrink_multiplier']:.2f}), "
+                      f"threshold={self.tail_conf_threshold:.2f}")
+        else:
+            # 使用静态参数（原始硬编码方式）
+            self.adaptive_bins = True
+            self.max_bins = 20
+            self.min_bin_size = 50
+            self.tail_conf_threshold = self.static_tail_conf_threshold
+            self.tail_gate_k = 10.0
+            self.tail_wrong_boost = self.static_tail_wrong_boost
+            self.tail_shrink_alpha = self.static_tail_shrink_alpha
+
+        # ========= 原有的分桶和等渗逻辑 =========
+        # 自适应分桶：保证每桶有足够样本，降低高段统计方差；
+        if self.adaptive_bins:
+            # 根据最小桶大小决定桶数，并限制不超过 max_bins
+            bins_by_size = int(len(xs) // max(self.min_bin_size, 1))
+            bins = max(1, min(self.max_bins, bins_by_size))
+        else:
+            bins = n_bins
+        edges = np.linspace(0, len(xs), bins + 1).astype(int)
+
         xb, yb, wb = [], [], []
-        for i in range(n_bins):
+        # 组内先验：用于尾段收缩（有外部样本权重则用加权平均）
+        prior_rate = float(np.average(ys, weights=ws)) if ws is not None else float(np.mean(ys))
+
+        for i in range(bins):
             a, b = edges[i], edges[i + 1]
             if b <= a:
                 continue
+
+            xmean = float(xs[a:b].mean())
+            # 尾段门控：置信度越高 gate 越接近 1（使用动态或静态阈值）
+            gate = 1.0 / (1.0 + np.exp(-self.tail_gate_k * (xmean - self.tail_conf_threshold)))
+
+            # 构造样本权重：在尾段提升负例（错误）的权重以抑制过置信（使用动态或静态权重）
             if ws is not None:
-                w_i = ws[a:b]
-                xb.append(float(xs[a:b].mean()))
-                yb.append(float(np.average(ys[a:b], weights=w_i)))
-                wb.append(float(w_i.sum()))
+                w_i = ws[a:b].astype(np.float64)
             else:
-                xb.append(float(xs[a:b].mean()))
-                yb.append(float(ys[a:b].mean()))
-                wb.append(float(b - a))
+                w_i = np.ones(b - a, dtype=np.float64)
+            wrong = (ys[a:b] < 0.5).astype(np.float64)  # 负例视为"错误"
+            w_boost = w_i * (1.0 + self.tail_wrong_boost * gate * wrong)
+
+            # 桶内加权平均与总权重
+            y_bin_raw = float(np.average(ys[a:b], weights=w_boost))
+            w_sum = float(w_boost.sum())
+
+            # 尾段先验收缩：向组内整体正例率收缩，稳定尾部输出（使用动态或静态收缩强度）
+            shrink = float(self.tail_shrink_alpha * gate)
+            y_bin = (1.0 - shrink) * y_bin_raw + shrink * prior_rate
+
+            xb.append(xmean)
+            yb.append(y_bin)
+            wb.append(w_sum)
+
         iso = IsotonicRegression(out_of_bounds=self.out_of_bounds, increasing=True)
         iso.fit(np.array(xb), np.array(yb), sample_weight=np.array(wb))
         return iso
 
+    # 新增：置信度带参与的最细分组 key（L5）
+    def _create_group_key5(self, t: int, a: int, p: int, m: int, b: int) -> str:
+        return f"t{t}_a{a}_p{p}_m{m}_b{b}"
+    
+    # 高置信度两层分组键生成方法
+    def _create_high_conf_key1(self, t: int) -> str:
+        """L1: token_type only (for high confidence)"""
+        return f"hc_t{t}"
+    
+    def _create_high_conf_key2(self, t: int, a: int) -> str:
+        """L2: token_type × attn_q (for high confidence)"""
+        return f"hc_t{t}_a{a}"
+
     def fit(self, features, soft_labels, hard_labels, sample_weights=None):
         proc = self._preprocess_features(features, fit_mode=True)
         c = proc['draft_conf']
-        token, attn, pos = proc['token_type'], proc['attn_q'], proc['pos_bin']
-        # 新增 margin_q 维度
-        margin_q = proc['margin_q']
-
+        token = proc['token_type']
+        attn = proc['attn_q']
+        pos = proc['pos_bin']
+        margin_q = proc.get('margin_q', np.zeros_like(attn))
+        
         y = hard_labels if self.target == 'hard' else soft_labels
         w = sample_weights
 
@@ -402,50 +695,152 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         self.global_calibrator = self._fit_iso_binned(c, y, w, n_bins=20)
         self.global_mean = float(np.average(y, weights=w) if w is not None else np.mean(y))
 
-        # L1
-        self.level1 = {}
-        for t in range(3):
-            idx = (token == t)
-            if idx.sum() >= self.min_samples_per_group:
-                self.level1[f"t{t}"] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
-            else:
-                self.level1[f"t{t}"] = None
-
-        # L2
-        self.level2 = {}
-        for t in range(3):
-            for a in range(5):
-                idx = (token == t) & (attn == a)
-                key = f"t{t}_a{a}"
+        if self.use_hybrid_grouping:
+            # 混合分组策略：根据置信度分别训练
+            print(f"[GroupedIsotonicCalibrator] 使用混合分组策略，置信度阈值: {self.confidence_threshold}")
+            
+            # 分离高低置信度数据
+            high_conf_mask = c >= self.confidence_threshold
+            low_conf_mask = c < self.confidence_threshold
+            
+            high_conf_count = int(high_conf_mask.sum())
+            low_conf_count = int(low_conf_mask.sum())
+            print(f"  高置信度样本数: {high_conf_count} ({high_conf_count/len(c)*100:.1f}%)")
+            print(f"  低置信度样本数: {low_conf_count} ({low_conf_count/len(c)*100:.1f}%)")
+            
+            # 高置信度两层分组训练
+            self.high_conf_level1, self.high_conf_level2 = {}, {}
+            
+            # 为高置信度数据计算全局温度缩放
+            if self.use_temperature_scaling and high_conf_count > 50:
+                high_conf_temp = self._compute_temperature_scaling(
+                    c[high_conf_mask], y[high_conf_mask], "high_conf_global"
+                )
+                print(f"    高置信度全局温度参数: {high_conf_temp:.3f}")
+            
+            # 高置信度 L1: token_type only
+            for t in range(3):
+                idx = high_conf_mask & (token == t)
+                key = self._create_high_conf_key1(t)
                 if idx.sum() >= self.min_samples_per_group:
-                    self.level2[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
-                else:
-                    self.level2[key] = None
-
-        # L3
-        self.level3 = {}
-        for t in range(3):
-            for a in range(5):
-                for p in range(2):
-                    key = self._create_group_key(t, a, p)
-                    idx = (token == t) & (attn == a) & (pos == p)
-                    if idx.sum() >= self.min_samples_per_group:
-                        self.level3[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                    self.high_conf_level1[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                    
+                    # 为该分组计算温度缩放参数
+                    if self.use_temperature_scaling and idx.sum() > 20:
+                        temp = self._compute_temperature_scaling(c[idx], y[idx], f"high_conf_{key}")
+                        print(f"    高置信度L1 {key}: {int(idx.sum())} 样本, 温度={temp:.3f}")
                     else:
-                        self.level3[key] = None
-
-        # L4
-        self.level4 = {}
-        for t in range(3):
-            for a in range(5):
-                for p in range(2):
-                    for m in range(3):
-                        key = self._create_group_key4(t, a, p, m)
-                        idx = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
-                        if idx.sum() >= self.min_samples_per_group:
-                            self.level4[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                        print(f"    高置信度L1 {key}: {int(idx.sum())} 样本")
+                else:
+                    self.high_conf_level1[key] = None
+            
+            # 高置信度 L2: token_type × attn_q
+            for t in range(3):
+                for a in range(5):
+                    idx = high_conf_mask & (token == t) & (attn == a)
+                    key = self._create_high_conf_key2(t, a)
+                    if idx.sum() >= self.min_samples_per_group:
+                        self.high_conf_level2[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                        
+                        # 为该分组计算温度缩放参数
+                        if self.use_temperature_scaling and idx.sum() > 20:
+                            temp = self._compute_temperature_scaling(c[idx], y[idx], f"high_conf_{key}")
+                            print(f"    高置信度L2 {key}: {int(idx.sum())} 样本, 温度={temp:.3f}")
                         else:
-                            self.level4[key] = None
+                            print(f"    高置信度L2 {key}: {int(idx.sum())} 样本")
+                    else:
+                        self.high_conf_level2[key] = None
+            
+            # 低置信度四层分组训练
+            self.level1, self.level2, self.level3, self.level4 = {}, {}, {}, {}
+            
+            # 低置信度 L1
+            for t in range(3):
+                idx = low_conf_mask & (token == t)
+                key = f"t{t}"
+                if idx.sum() >= self.min_samples_per_group:
+                    self.level1[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                else:
+                    self.level1[key] = None
+
+            # 低置信度 L2
+            for t in range(3):
+                for a in range(5):
+                    idx = low_conf_mask & (token == t) & (attn == a)
+                    key = f"t{t}_a{a}"
+                    if idx.sum() >= self.min_samples_per_group:
+                        self.level2[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                    else:
+                        self.level2[key] = None
+
+            # 低置信度 L3
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        key = self._create_group_key(t, a, p)
+                        idx = low_conf_mask & (token == t) & (attn == a) & (pos == p)
+                        if idx.sum() >= self.min_samples_per_group:
+                            self.level3[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                        else:
+                            self.level3[key] = None
+
+            # 低置信度 L4
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        for m in range(3):
+                            key = self._create_group_key4(t, a, p, m)
+                            idx = low_conf_mask & (token == t) & (attn == a) & (pos == p) & (margin_q == m)
+                            if idx.sum() >= self.min_samples_per_group:
+                                self.level4[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                            else:
+                                self.level4[key] = None
+        else:
+            # 原始四层分组策略
+            # L1
+            self.level1 = {}
+            for t in range(3):
+                idx = (token == t)
+                if idx.sum() >= self.min_samples_per_group:
+                    self.level1[f"t{t}"] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                else:
+                    self.level1[f"t{t}"] = None
+
+            # L2
+            self.level2 = {}
+            for t in range(3):
+                for a in range(5):
+                    idx = (token == t) & (attn == a)
+                    key = f"t{t}_a{a}"
+                    if idx.sum() >= self.min_samples_per_group:
+                        self.level2[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                    else:
+                        self.level2[key] = None
+
+            # L3
+            self.level3 = {}
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        key = self._create_group_key(t, a, p)
+                        idx = (token == t) & (attn == a) & (pos == p)
+                        if idx.sum() >= self.min_samples_per_group:
+                            self.level3[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                        else:
+                            self.level3[key] = None
+
+            # L4
+            self.level4 = {}
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        for m in range(3):
+                            key = self._create_group_key4(t, a, p, m)
+                            idx = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
+                            if idx.sum() >= self.min_samples_per_group:
+                                self.level4[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                            else:
+                                self.level4[key] = None
 
         self.is_fitted = True
 
@@ -456,315 +851,100 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         margin_q = proc['margin_q']
 
         out = np.zeros_like(c, dtype=np.float32)
-        for t in range(3):
-            for a in range(5):
-                for p in range(2):
-                    for m in range(3):
-                        mask = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
-                        if mask.sum() == 0:
-                            continue
-                        key4 = self._create_group_key4(t, a, p, m)
-                        key3 = self._create_group_key(t, a, p)
-                        key2 = f"t{t}_a{a}"
-                        key1 = f"t{t}"
-                        cal = (
-                            (self.level4.get(key4) if hasattr(self, 'level4') else None)
-                            or self.level3.get(key3)
-                            or self.level2.get(key2)
-                            or self.level1.get(key1)
-                            or self.global_calibrator
-                        )
-                        if cal is not None:
-                            out[mask] = cal.predict(c[mask])
-                        else:
-                            out[mask] = self.global_mean
+        
+        if self.use_hybrid_grouping:
+            # 混合分组策略预测
+            high_conf_mask = c >= self.confidence_threshold
+            low_conf_mask = c < self.confidence_threshold
+            
+            # 高置信度：使用两层分组
+            for t in range(3):
+                for a in range(5):
+                    mask = high_conf_mask & (token == t) & (attn == a)
+                    if mask.sum() == 0:
+                        continue
+                    
+                    # 高置信度回退：L2 -> L1 -> global
+                    key2 = self._create_high_conf_key2(t, a)
+                    key1 = self._create_high_conf_key1(t)
+                    cal = (
+                        self.high_conf_level2.get(key2)
+                        or self.high_conf_level1.get(key1)
+                        or self.global_calibrator
+                    )
+                    if cal is not None:
+                        # 先进行等渗校准
+                        calibrated_probs = cal.predict(c[mask])
+                        
+                        # 再应用温度缩放（如果启用）
+                        if self.use_temperature_scaling:
+                            # 选择合适的温度参数：优先使用分组特定的，然后是全局的
+                            temp_key_options = [
+                                f"high_conf_{key2}",
+                                f"high_conf_{key1}", 
+                                "high_conf_global"
+                            ]
+                            temperature = 1.0
+                            for temp_key in temp_key_options:
+                                if temp_key in self.temperature_params:
+                                    temperature = self.temperature_params[temp_key]
+                                    break
+                            
+                            # 应用温度缩放
+                            calibrated_probs = self._apply_temperature_scaling(calibrated_probs, temperature)
+                        
+                        out[mask] = calibrated_probs
+                    else:
+                        out[mask] = self.global_mean
+            
+            # 低置信度：使用四层分组
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        for m in range(3):
+                            mask = low_conf_mask & (token == t) & (attn == a) & (pos == p) & (margin_q == m)
+                            if mask.sum() == 0:
+                                continue
+                            key4 = self._create_group_key4(t, a, p, m)
+                            key3 = self._create_group_key(t, a, p)
+                            key2 = f"t{t}_a{a}"
+                            key1 = f"t{t}"
+                            cal = (
+                                (self.level4.get(key4) if hasattr(self, 'level4') else None)
+                                or self.level3.get(key3)
+                                or self.level2.get(key2)
+                                or self.level1.get(key1)
+                                or self.global_calibrator
+                            )
+                            if cal is not None:
+                                out[mask] = cal.predict(c[mask])
+                            else:
+                                out[mask] = self.global_mean
+        else:
+            # 原始四层分组策略
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        for m in range(3):
+                            mask = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
+                            if mask.sum() == 0:
+                                continue
+                            key4 = self._create_group_key4(t, a, p, m)
+                            key3 = self._create_group_key(t, a, p)
+                            key2 = f"t{t}_a{a}"
+                            key1 = f"t{t}"
+                            cal = (
+                                (self.level4.get(key4) if hasattr(self, 'level4') else None)
+                                or self.level3.get(key3)
+                                or self.level2.get(key2)
+                                or self.level1.get(key1)
+                                or self.global_calibrator
+                            )
+                            if cal is not None:
+                                out[mask] = cal.predict(c[mask])
+                            else:
+                                out[mask] = self.global_mean
         return np.clip(out, 1e-4, 1 - 1e-4)
-
-
-class MonotonicNetworkCalibrator(BaseCalibrator):
-    """
-    更激进的单调网络校准器（特征条件 Logit 仿射）
-      logit(p̂) = a(φ) + b(φ) * logit(c)
-      其中 b(φ) = 1 + softplus(s(φ))  >= 1  —— 对 c 单调且“放大”高分区
-    """
-
-    def __init__(self,
-                 hidden_dim: int = 64,
-                 learning_rate: float = 1e-3,
-                 max_epochs: int = 600,
-                 patience: int = 50,
-                 device: str = None,
-                 weight_decay: float = 1e-4,
-                 grad_clip: float = 1.0,
-                 max_slope: float = 6.0,          # b(φ) 的最大值（防数值爆炸）
-                 n_reweight_bins: int = 20):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.learning_rate = learning_rate
-        self.max_epochs = max_epochs
-        self.patience = patience
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.weight_decay = weight_decay
-        self.grad_clip = grad_clip
-        self.max_slope = float(max_slope)
-        self.n_reweight_bins = n_reweight_bins
-
-        # 训练期统计
-        self.z_mean = None
-        self.z_std = None
-        self.model = None
-        set_seed(42)
-
-    # ---------- utils ----------
-    @staticmethod
-    def _equal_freq_weights(conf: np.ndarray, n_bins: int = 20) -> np.ndarray:
-        c = np.asarray(conf, dtype=np.float64)
-        edges = np.quantile(c, np.linspace(0, 1, n_bins + 1))
-        edges = np.unique(edges)
-        bins = np.digitize(c, edges[1:-1], right=True)
-        counts = np.bincount(bins, minlength=len(edges) - 1).astype(np.float64)
-        counts[counts == 0] = 1.0
-        w = 1.0 / counts[bins]
-        return (w * (len(w) / w.sum())).astype('float32')
-
-    def _build_phi(self, proc: Dict[str, np.ndarray]) -> np.ndarray:
-        # one-hot / 归一化 与你现有 BaseCalibrator 的预处理保持一致
-        token = np.eye(3)[proc['token_type']]
-        # attn_q 五等分分组 -> 5 维 one-hot（防越界）
-        attn_idx = np.asarray(proc['attn_q'], dtype=int)
-        attn_idx = np.clip(attn_idx, 0, 4)
-        attn = np.eye(5)[attn_idx]
-        pos  = np.eye(2)[proc['pos_bin']]
-
-        # 新增：draft_margin 的三等分分组 -> 3 维 one-hot
-        # 若预处理提供 margin_q 则直接使用；否则在线计算并带回退保护
-        if 'margin_q' in proc:
-            m_q_idx = np.asarray(proc['margin_q'], dtype=int)
-            m_q_idx = np.clip(m_q_idx, 0, 2)
-        elif 'draft_margin' in proc:
-            m = np.asarray(proc['draft_margin'], dtype=np.float64)
-            edges = np.quantile(m, [0.33, 0.67])
-            m_q_idx = np.digitize(m, edges, right=True)  # 0,1,2
-        else:
-            m_q_idx = np.zeros(token.shape[0], dtype=int)
-        margin_q_oh = np.eye(3)[m_q_idx]
-
-        td = proc['tree_depth']
-        tmin, tmax = float(td.min()), float(td.max())
-        tree = ((td - tmin) / (tmax - tmin + 1e-8)).reshape(-1, 1)
-
-        ai = proc['avg_visual_attention_intensity']
-        amin, amax = float(ai.min()), float(ai.max())
-        attn_norm = ((ai - amin) / (amax - amin + 1e-8)).reshape(-1, 1)
-
-        parts = [token, attn, pos, margin_q_oh, tree, attn_norm]
-
-        if 'draft_margin' in proc:
-            m = proc['draft_margin']
-            mmin, mmax = float(m.min()), float(m.max())
-            parts.append(((m - mmin) / (mmax - mmin + 1e-8)).reshape(-1, 1))
-
-        phi = np.concatenate(parts, axis=1).astype('float32')
-        self.phi_dim = int(phi.shape[1])
-        return phi
-
-    def _logit_and_standardize(self, conf: np.ndarray, fit_mode: bool) -> np.ndarray:
-        c = np.clip(np.asarray(conf, dtype=np.float32), 1e-6, 1 - 1e-6)
-        z = np.log(c) - np.log(1.0 - c)  # logit(c)
-        if fit_mode or (self.z_mean is None) or (self.z_std is None):
-            self.z_mean = float(z.mean())
-            self.z_std = float(z.std() + 1e-6)
-        z = (z - self.z_mean) / self.z_std
-        return z.astype('float32')
-
-    # ---------- model ----------
-    class _AffineMono(nn.Module):
-        """φ -> a, s； b = 1 + softplus(s)；logits = a + clamp(b,1,max_slope) * z"""
-        def __init__(self, phi_dim: int, hidden_dim: int, max_slope: float):
-            super().__init__()
-            self.max_slope = max_slope
-            self.backbone = nn.Sequential(
-                nn.Linear(phi_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(inplace=True)
-            )
-            self.head_a = nn.Linear(hidden_dim, 1)
-            self.head_s = nn.Linear(hidden_dim, 1)  # slope raw
-
-        def forward(self, phi: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-            h = self.backbone(phi)
-            a = self.head_a(h).squeeze(-1)
-            s = self.head_s(h).squeeze(-1)
-            b = 1.0 + F.softplus(s)                  # >=1
-            if self.max_slope is not None:
-                b = torch.clamp(b, max=self.max_slope)
-            logits = a + b * z
-            return logits
-
-    # ---------- fit/predict ----------
-    def fit(self,
-            features: Dict[str, np.ndarray],
-            soft_labels: np.ndarray,
-            hard_labels: np.ndarray,
-            sample_weights: Optional[np.ndarray] = None):
-
-        proc = self._preprocess_features(features, fit_mode=True)
-        phi = self._build_phi(proc)
-        z = self._logit_and_standardize(proc['draft_conf'], fit_mode=True)
-
-        # 目标用硬标签（更贴近“是否接受”）
-        y = np.asarray(hard_labels, dtype=np.float32)
-        # 等频重加权（conf 段均衡）
-        if sample_weights is None:
-            w = self._equal_freq_weights(proc['draft_conf'], self.n_reweight_bins)
-        else:
-            w = np.asarray(sample_weights, dtype=np.float32)
-
-        # 类不平衡：pos_weight
-        pos_rate = float(y.mean())
-        pos_weight = (1.0 - pos_rate) / max(pos_rate, 1e-6)
-        pos_weight = max(1.0, min(30.0, pos_weight))
-
-        # tensor
-        device = self.device
-        phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
-        z_t   = torch.tensor(z, dtype=torch.float32, device=device)
-        y_t   = torch.tensor(y, dtype=torch.float32, device=device)
-        w_t   = torch.tensor(w, dtype=torch.float32, device=device)
-
-        self.model = self._AffineMono(self.phi_dim, self.hidden_dim, self.max_slope).to(device)
-
-        # 初始化 a 的偏置为全局 logit(pos_rate)
-        with torch.no_grad():
-            b0 = float(np.log(pos_rate + 1e-8) - np.log(1 - pos_rate + 1e-8))
-            nn.init.zeros_(self.model.head_a.weight)
-            nn.init.constant_(self.model.head_a.bias, b0)
-            nn.init.zeros_(self.model.head_s.weight)
-            nn.init.constant_(self.model.head_s.bias, 0.0)  # slope 初始 ~ 1+softplus(0)=1.693
-
-        opt = torch.optim.AdamW(self.model.parameters(),
-                                lr=self.learning_rate,
-                                weight_decay=self.weight_decay)
-        bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device), reduction='none')
-
-        # train/val split
-        n = phi_t.size(0)
-        idx = torch.randperm(n, device=device)
-        split = max(int(0.9 * n), 1)
-        tr, va = idx[:split], idx[split:]
-
-        best, patience, best_sd = float('inf'), self.patience, None
-        for ep in range(self.max_epochs):
-            # train
-            self.model.train(); opt.zero_grad()
-            logits_tr = self.model(phi_t[tr], z_t[tr])
-            loss_vec  = bce(logits_tr, y_t[tr]) * w_t[tr]
-            loss = loss_vec.mean()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            opt.step()
-
-            # val
-            self.model.eval()
-            with torch.no_grad():
-                logits_va = self.model(phi_t[va], z_t[va])
-                loss_va = (bce(logits_va, y_t[va]) * w_t[va]).mean()
-
-            if (ep % 20) == 0:
-                p_tr = torch.sigmoid(logits_tr).detach().cpu().numpy()
-                print(f"[MonoAgg] Epoch {ep:03d}  train={float(loss):.4f}  val={float(loss_va):.4f}  "
-                      f"p[min/mean/max]={p_tr.min():.3f}/{p_tr.mean():.3f}/{p_tr.max():.3f}")
-
-            if float(loss_va) + 1e-6 < best:
-                best, patience = float(loss_va), self.patience
-                best_sd = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-            else:
-                patience -= 1
-                if patience <= 0:
-                    break
-
-        if best_sd is not None:
-            self.model.load_state_dict(best_sd)
-
-        self.is_fitted = True
-
-    def predict_proba(self, features: Dict[str, np.ndarray]) -> np.ndarray:
-        if not self.is_fitted:
-            raise ValueError("Call fit() first")
-
-        proc = self._preprocess_features(features, fit_mode=False)
-        phi = self._build_phi(proc)
-        z = self._logit_and_standardize(proc['draft_conf'], fit_mode=False)
-
-        device = self.device
-        phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
-        z_t   = torch.tensor(z, dtype=torch.float32, device=device)
-        self.model.eval()
-        with torch.no_grad():
-            logits = self.model(phi_t, z_t)
-            p = torch.sigmoid(logits).clamp(1e-4, 1 - 1e-4).cpu().numpy()
-        return p.astype('float32')
-
-
-
-class MonotonicMLP(nn.Module):
-    """单调MLP模型
-    
-    logit(p_tilde) = β(φ) + Σ_k γ_k(φ) * s_k(c)
-    其中 γ_k(φ) ≥ 0 通过 softplus 确保
-    """
-    
-    def __init__(self, phi_dim: int, n_basis: int, hidden_dim: int):
-        super().__init__()
-        self.phi_dim = phi_dim
-        self.n_basis = n_basis
-        self.hidden_dim = hidden_dim
-        
-        # β(φ) 网络 - 偏置项
-        self.beta_net = nn.Sequential(
-            nn.Linear(phi_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
-        # γ_k(φ) 网络 - 单调系数（确保非负）
-        self.gamma_net = nn.Sequential(
-            nn.Linear(phi_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, n_basis)
-        )
-        
-    def forward(self, phi: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            phi: 特征向量 (batch_size, phi_dim)
-            basis: 基函数值 (batch_size, n_basis)
-        
-        Returns:
-            logits: (batch_size,)
-        """
-        # 计算偏置项 β(φ)
-        beta = self.beta_net(phi).squeeze(-1)  # (batch_size,)
-        
-        # 计算单调系数 γ_k(φ)，使用 softplus 确保非负
-        gamma = F.softplus(self.gamma_net(phi))  # (batch_size, n_basis)
-        
-        # 计算单调项 Σ_k γ_k(φ) * s_k(c)
-        monotonic_term = (gamma * basis).sum(dim=1)  # (batch_size,)
-        
-        # 最终logit
-        logits = beta + monotonic_term
-        
-        return logits
-        
-# =========================
-# Data loader + quick tests
-# =========================
 
 def load_calibration_data(path: str) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
     if path.endswith('.json'):
@@ -800,7 +980,6 @@ def _print_metrics(name: str, metrics: Dict[str, float]):
         if k in metrics:
             print(f"  {k}: {metrics[k]:.6f}")
 
-
 def calibrator_training(calibrator_dir: str, json_path: str):
     """
     训练 Grouped Isotonic 与 Monotonic Network 两种校准器并保存到指定目录。
@@ -824,7 +1003,13 @@ def calibrator_training(calibrator_dir: str, json_path: str):
     os.makedirs(calibrator_dir, exist_ok=True)
 
     # 训练 Isotonic（硬标签）
-    gi = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard')
+    gi = GroupedIsotonicCalibrator(
+        use_hybrid_grouping=True,
+        confidence_threshold=0.7,
+        use_temperature_scaling=True,
+        temperature_range=(1.2, 2.5),
+        min_samples_per_group=50
+    )
     gi.fit(feats, soft, hard)
     metrics_gi = gi.evaluate(feats, soft, hard)
     gi_model_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
@@ -839,24 +1024,12 @@ def calibrator_training(calibrator_dir: str, json_path: str):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[Calibrator] Using device for Monotonic Network: {device}")
 
-    # 训练 Monotonic Network（软标签）
-    mn = MonotonicNetworkCalibrator(hidden_dim=64, learning_rate=1e-3, max_epochs=1000, patience=50, device=device)
-    mn.fit(feats, soft, hard)
-    metrics_mn = mn.evaluate(feats, soft, hard)
-    mn_model_path = os.path.join(calibrator_dir, "monotonic_network_calibrator.pkl")
-    mn_metrics_path = os.path.join(calibrator_dir, "monotonic_network_metrics.json")
-    mn.save(mn_model_path)
-    with open(mn_metrics_path, "w") as f:
-        json.dump(metrics_mn, f, indent=2)
-    print(f"[Calibrator] Saved Monotonic Network calibrator to: {mn_model_path}")
-    print(f"[Calibrator] Saved training metrics to: {mn_metrics_path}")
-
-    return gi, mn
+    return gi, None
 
 
 if __name__ == "__main__":
     # test_calibrator_training()
     # compare_before_after_calibration()
     calibrator_path = "/root/Speculative_decoding/calibration_data/test_calibrators"
-    json_path = "/root/Speculative_decoding/calibration_data/mathverse_testmini_text_dominant_calib_monotonic_train_315_val_0_test_473_total_788/training_calibration_data.json"
+    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_600_val_0_test_900_total_1500_temperature_1/training_calibration_data.json"
     calibrator_training(calibrator_path, json_path)
