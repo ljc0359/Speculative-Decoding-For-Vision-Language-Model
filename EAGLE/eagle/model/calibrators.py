@@ -295,7 +295,8 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         self.level1, self.level2, self.level3, self.level4 = {}, {}, {}, {}
         # 两层分组存储（高置信度使用）
         self.high_conf_level1, self.high_conf_level2 = {}, {}
-        
+        self.verbose = True
+
         # 分组特定的temperature参数存储
         self.group_temperatures = {}  # 存储每个组的最优temperature
         self.global_temperature = 1.0  # 全局默认temperature
