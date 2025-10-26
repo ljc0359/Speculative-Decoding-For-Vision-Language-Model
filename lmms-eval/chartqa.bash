@@ -35,7 +35,7 @@ export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
     --msd_model_path /root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-7B \
     --tasks chartqa \
     --batch_size 1 \
-    --gen_kwargs temperature=1 \
+    --gen_kwargs temperature=0 \
     --use_msd \
     --log_samples \
     --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/chartqa.json \

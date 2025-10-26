@@ -55,30 +55,16 @@ class EaModel(nn.Module):
             bias=con["bias"]
         except:
             bias=True
-        # Select draft network implementation
-        if use_talon:
-            print("[TALON] use_talon: ",use_talon)
-            from .cnets_talon import Model as DraftModel
-
-            self.ea_layer = DraftModel(
-                config,
-                bias=bias,
-                total_tokens=total_token,
-                depth=depth,
-                top_k=top_k,
-                threshold=threshold
-            )
-
-        else:
-            from .cnets import Model as DraftModel
-            self.ea_layer = DraftModel(
-                config,
-                bias=bias,
-                total_tokens=total_token,
-                depth=depth,
-                top_k=top_k,
-                threshold=threshold
-            )
+            
+        from .cnets import Model as DraftModel
+        self.ea_layer = DraftModel(
+            config,
+            bias=bias,
+            total_tokens=total_token,
+            depth=depth,
+            top_k=top_k,
+            threshold=threshold
+        )
 
         low_memory=False
 
@@ -116,8 +102,8 @@ class EaModel(nn.Module):
             base_model_path=None,
             ea_model_path=None,
             total_token=59,
-            depth=5,
-            top_k=10,
+            depth=4,
+            top_k=8,
             threshold=1.0,
             use_talon: bool = False,
             **kwargs,

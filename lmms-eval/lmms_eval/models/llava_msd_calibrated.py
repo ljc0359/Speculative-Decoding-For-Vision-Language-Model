@@ -109,7 +109,9 @@ class Llava_MSD_Calibrated(lmms):
                 torch_dtype=torch.float16,
                 low_cpu_mem_usage=True,
                 device_map="auto",
-                total_token=-1
+                total_token=-1,
+                top_k=10,
+                depth=6
         )
 
         self._config = self._model.base_model.config
@@ -572,6 +574,7 @@ class Llava_MSD_Calibrated(lmms):
                     
                     print(f"actual temperature {gen_kwargs['temperature']}")
                     # 传递inputs_embeds给msdgenerate，这样可以正确计算图像token位置
+
                     output_ids = self.model.msdgenerate(
                         input_ids, 
                         inputs_embeds=inputs_embeds, 
@@ -587,6 +590,7 @@ class Llava_MSD_Calibrated(lmms):
                         calibrator=trained_calibrators.get(calibrator_mode, None) if use_calibrator else None
                         # calibrator=None
                     ) 
+
                     
                     print(f"actual temperature {gen_kwargs['temperature']}")
                     # accumulate overall stats

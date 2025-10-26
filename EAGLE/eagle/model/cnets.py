@@ -92,7 +92,7 @@ def len_list(x, n):
 
 
 class Model(nn.Module):
-    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0, train_embed=False, decouple=False):
+    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0, train_embed=False, decouple=False, draft_temperature=1.0):
         super().__init__()
 
         self.gradient_checkpointing = True
@@ -111,6 +111,7 @@ class Model(nn.Module):
         self.total_tokens = total_tokens - 1
         self.depth = depth
         self.threshold = math.log(threshold)
+        self.draft_temperature = draft_temperature  # Temperature scaling for draft model logits
 
         from eagle.model.ea_llama_model import LlamaDecoderLayer
         from eagle.model.ea_qwen2vl_model import Qwen2VLDecoderLayer, Qwen2VLRotaryEmbedding
@@ -777,10 +778,9 @@ class Model(nn.Module):
         return calibration_data
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=1, if_adaptive=True):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, base_model=None, context_past_key_values=None, train_calibrator=False, use_calibrator=False, calibrator=None, alpha=1):
         alpha = float(alpha)
         
-        # === helper: compute per-candidate adaptive alpha in [0, alpha] ===
         def _compute_adaptive_alpha(data_list, base_alpha: float, layer_idx: int, shape=None, device=None, dtype=None, if_adaptive=True):
             """
             data_list: list[dict] from _collect_calibration_data_safely
@@ -865,19 +865,7 @@ class Model(nn.Module):
             combo = np.clip(combo * tok_boost, 0.0, 1.2)
             combo = np.clip(combo, 0.2, 0.8)
 
-            # 高段 alpha 门控收缩（平滑 sigmoidal）
-            CONF_HIGH_THRESHOLD = 0.68
-            GATE_SMOOTH_K = 18.0
-            HIGH_CONF_ALPHA_SHRINK = 0.5  # 最高收缩 50%
-            if np.isnan(conf_arr).all():
-                conf_arr[:] = CONF_HIGH_THRESHOLD
-            else:
-                c_med = np.nanmedian(conf_arr)
-                conf_arr = np.where(np.isnan(conf_arr), c_med, conf_arr)
-            gate = 1.0 / (1.0 + np.exp(-GATE_SMOOTH_K * (conf_arr - CONF_HIGH_THRESHOLD)))  # [0,1]
-            shrink = 1.0 - HIGH_CONF_ALPHA_SHRINK * gate
-
-            alpha_vec = base_alpha * combo * shrink  # 限制不超过全局 alpha
+            alpha_vec = base_alpha * combo  # 限制不超过全局 alpha
             alpha_t = torch.tensor(alpha_vec, device=device, dtype=dtype)
             if len(shape) == 2:
                 # layer_i: 需要 reshape 成 [top_k, top_k]
@@ -891,6 +879,8 @@ class Model(nn.Module):
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
+
+        print(f"top k: {top_k} depth: {depth}")
         sample_token = input_ids[:, -1]
 
         if inputs_embeds is not None:
@@ -996,6 +986,9 @@ class Model(nn.Module):
         past_key_values = self.stable_kv
         last_hidden = out_hidden[:, -1]
         last_headout = head(last_hidden)
+        # Apply temperature scaling to draft model logits (Layer 0)
+        if self.draft_temperature != 1.0:
+            last_headout = last_headout / self.draft_temperature
         last_p = self.logsoftmax(last_headout)
 
         # ---------- 第 0 层：预选 top_k*2，校准融合（使用当前 alpha 形式），然后重排选最终 top_k ----------
@@ -1036,15 +1029,17 @@ class Model(nn.Module):
                 import numpy as np
 
                 features_df = pd.DataFrame(layer_0_pre_data)
+                
+                # 使用 isotonic calibrator 进行校准
                 calibrated_probs = calibrator.predict_proba(features_df)
                 PROB_FLOOR = 1e-3
                 calibrated_probs = np.clip(calibrated_probs, PROB_FLOOR, 1.0 - PROB_FLOOR)
 
                 # 计算校准 logit 并裁剪，形状 [1, preselect_k]
                 calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
-                NEG_MAX_CALIB_LOGIT = 5.0
-                POS_MAX_CALIB_LOGIT = 1.5
-                calibrated_logits_np = np.clip(calibrated_logits_np, -NEG_MAX_CALIB_LOGIT, POS_MAX_CALIB_LOGIT)
+                # 使用对称的裁剪范围，避免高段overconfidence
+                MAX_CALIB_LOGIT = 3.0
+                calibrated_logits_np = np.clip(calibrated_logits_np, -MAX_CALIB_LOGIT, MAX_CALIB_LOGIT)
                 calibrated_logits_tensor = torch.tensor(
                     calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
                 ).view(1, preselect_k)
@@ -1056,8 +1051,7 @@ class Model(nn.Module):
                     layer_idx=0,
                     shape=(preselect_k,),
                     device=preselect_p.device,
-                    dtype=preselect_p.dtype,
-                    if_adaptive=if_adaptive
+                    dtype=preselect_p.dtype
                 ).view(1, preselect_k)
 
                 # 在原始 logits 上加性修正：bias = α_i * logit(p_accept_i)
@@ -1137,6 +1131,9 @@ class Model(nn.Module):
             parents_list.append(parents)
 
             last_headout = head(out_hidden[0])
+            # Apply temperature scaling to draft model logits
+            if self.draft_temperature != 1.0:
+                last_headout = last_headout / self.draft_temperature
             last_p = self.logsoftmax(last_headout)
 
             preselect_k = 2 * top_k if not train_calibrator else top_k
@@ -1187,15 +1184,17 @@ class Model(nn.Module):
                     import pandas as pd
                     import numpy as np
                     features_df = pd.DataFrame(layer_i_data)
+                    
+                    # 使用 isotonic calibrator 进行校准
                     calibrated_probs = calibrator.predict_proba(features_df)
                     PROB_FLOOR = 1e-3
                     calibrated_probs = np.clip(calibrated_probs, PROB_FLOOR, 1.0 - PROB_FLOOR)
 
                     # 校准 logit 并裁剪，形状 [top_k, preselect_k]
                     calibrated_logits_np = np.log(calibrated_probs) - np.log(1.0 - calibrated_probs)
-                    NEG_MAX_CALIB_LOGIT = 5.0
-                    POS_MAX_CALIB_LOGIT = 1.5
-                    calibrated_logits_np = np.clip(calibrated_logits_np, -NEG_MAX_CALIB_LOGIT, POS_MAX_CALIB_LOGIT)
+                    # 使用对称的裁剪范围，避免高段overconfidence
+                    MAX_CALIB_LOGIT = 3.0
+                    calibrated_logits_np = np.clip(calibrated_logits_np, -MAX_CALIB_LOGIT, MAX_CALIB_LOGIT)
                     calibrated_logits_tensor = torch.tensor(
                         calibrated_logits_np, device=preselect_p.device, dtype=preselect_p.dtype
                     ).view(top_k, preselect_k)
@@ -1207,8 +1206,7 @@ class Model(nn.Module):
                         layer_idx=i + 1,
                         shape=(top_k, preselect_k),
                         device=preselect_p.device,
-                        dtype=preselect_p.dtype,
-                        if_adaptive=if_adaptive
+                        dtype=preselect_p.dtype
                     ).view(top_k, preselect_k)
 
                     # 对每个父节点的原始 logits 做加性修正

@@ -4,6 +4,25 @@ Calibrators for EAGLE draft confidence
 - Grouped Isotonic (with hierarchical fallback)
 - Monotonic MLP (stabilized, hard-label first)
 - Platt scaling baseline
+
+=== 校准优化改进 (基于文献研究) ===
+本版本针对高置信度区域的校准问题进行了以下优化：
+
+1. **参数温和化**：
+   - tail_wrong_boost: 5.0 → 1.5-3.0 (避免过度提升错误样本权重)
+   - tail_gate_k: 10.0 → 3.0 (使sigmoid门控更平滑)
+   - tail_shrink_alpha: 0.5-0.8 → 0.3-0.5 (减少先验收缩强度)
+
+2. **自适应分桶策略**：
+   - 高置信度样本<10%时使用2倍最小桶大小
+   - 高置信度样本<20%时使用1.5倍最小桶大小
+   - 实现等频分桶替代等宽分桶
+
+3. **数据增强策略**：
+   - 对高置信度稀疏桶增加样本权重(最大3倍)
+   - 根据稀疏程度动态调整权重提升倍数
+
+这些改进遵循了概率校准的核心原则：平滑性、泛化能力和统计稳定性。
 """
 
 import os
@@ -256,8 +275,9 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                  use_adaptive_params: bool = False,
                  use_hybrid_grouping: bool = True,
                  confidence_threshold: float = 0.6,
-                 use_temperature_scaling: bool = True,
-                 temperature_range: tuple = (1.2, 2.0)):
+                 enable_temperature_scaling: bool = True,
+                 temperature_search_range: tuple = (0.5, 3.0),
+                 temperature_search_steps: int = 20):
         super().__init__()
         self.min_samples_per_group = min_samples_per_group
         self.out_of_bounds = out_of_bounds
@@ -265,23 +285,27 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         self.use_adaptive_params = use_adaptive_params  # 动态校准参数开关
         self.use_hybrid_grouping = use_hybrid_grouping  # 混合分组策略开关
         self.confidence_threshold = confidence_threshold  # 高低置信度分组阈值
-        self.use_temperature_scaling = use_temperature_scaling  # 温度缩放开关
-        self.temperature_range = temperature_range  # 温度缩放范围
+        
+        # Temperature Scaling 相关参数
+        self.enable_temperature_scaling = enable_temperature_scaling
+        self.temperature_search_range = temperature_search_range
+        self.temperature_search_steps = temperature_search_steps
         
         # 四层分组存储（低置信度使用）
         self.level1, self.level2, self.level3, self.level4 = {}, {}, {}, {}
         # 两层分组存储（高置信度使用）
         self.high_conf_level1, self.high_conf_level2 = {}, {}
         
-        # 温度缩放参数存储
-        self.temperature_params = {}
+        # 分组特定的temperature参数存储
+        self.group_temperatures = {}  # 存储每个组的最优temperature
+        self.global_temperature = 1.0  # 全局默认temperature
         
         self.global_calibrator = None
         self.global_mean = None
         
-        # 静态参数（当use_adaptive_params=False时使用）
-        self.static_tail_wrong_boost = 2.0
-        self.static_tail_shrink_alpha = 0.5
+        # 静态参数（当use_adaptive_params=False时使用）- 优化为更温和的值
+        self.static_tail_wrong_boost = 1.5  # 从2.0降低到1.5，避免过度提升错误样本权重
+        self.static_tail_shrink_alpha = 0.3  # 从0.5降低到0.3，减少先验收缩强度
         self.static_tail_conf_threshold = 0.75
 
     def _compute_overconfidence_metrics(self, x, y, w=None):
@@ -356,9 +380,9 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         Returns:
             dict: 自适应的校准参数
         """
-        # 基础参数
-        base_wrong_boost = 2.0
-        base_shrink_alpha = 0.5
+        # 基础参数 - 优化为更温和的值
+        base_wrong_boost = 1.5  # 从2.0降低到1.5
+        base_shrink_alpha = 0.3  # 从0.5降低到0.3
         base_threshold = 0.75
         
         # 根据过度自信程度动态调整
@@ -368,16 +392,16 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         tail_overconf = overconf_metrics["tail_overconf"]
         
         # 1. 动态错误权重提升系数
-        # 过度自信越严重，错误样本权重提升越大
-        boost_multiplier = 1.0 + 3.0 * overconf_ratio + 2.0 * high_conf_error_rate
+        # 过度自信越严重，错误样本权重提升越大，但使用更温和的系数
+        boost_multiplier = 1.0 + 2.0 * overconf_ratio + 1.5 * high_conf_error_rate  # 降低系数
         adaptive_wrong_boost = base_wrong_boost * boost_multiplier
-        adaptive_wrong_boost = min(adaptive_wrong_boost, 5.0)  # 上限保护
+        adaptive_wrong_boost = min(adaptive_wrong_boost, 3.0)  # 从5.0降低到3.0，避免过度提升
         
         # 2. 动态先验收缩强度
-        # 校准差距越大，收缩越强
-        shrink_multiplier = 1.0 + 1.5 * calibration_gap + 2.0 * tail_overconf
+        # 校准差距越大，收缩越强，但使用更温和的系数
+        shrink_multiplier = 1.0 + 1.0 * calibration_gap + 1.5 * tail_overconf  # 降低系数
         adaptive_shrink_alpha = base_shrink_alpha * shrink_multiplier
-        adaptive_shrink_alpha = min(adaptive_shrink_alpha, 0.8)  # 上限保护
+        adaptive_shrink_alpha = min(adaptive_shrink_alpha, 0.5)  # 从0.8降低到0.5，避免过度收缩
         
         # 3. 动态置信度阈值
         # 如果尾段过度自信严重，降低阈值以扩大校准范围
@@ -393,84 +417,7 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
             "shrink_multiplier": shrink_multiplier
         }
     
-    def _compute_temperature_scaling(self, confidences, labels, group_key="global"):
-        """
-        计算温度缩放参数来解决过度自信问题
-        
-        Args:
-            confidences: 置信度数组
-            labels: 真实标签数组  
-            group_key: 分组键，用于存储不同组的温度参数
-            
-        Returns:
-            optimal_temperature: 最优温度参数
-        """
-        if not self.use_temperature_scaling:
-            return 1.0
-            
-        confidences = np.array(confidences)
-        labels = np.array(labels)
-        
-        # 过滤掉极端值
-        valid_mask = (confidences > 1e-6) & (confidences < 1 - 1e-6)
-        if np.sum(valid_mask) < 10:  # 样本太少，不进行温度缩放
-            return 1.0
-            
-        confidences = confidences[valid_mask]
-        labels = labels[valid_mask]
-        
-        def temperature_loss(temperature):
-            """温度缩放损失函数（负对数似然）"""
-            temp_confidences = self._apply_temperature_scaling(confidences, temperature)
-            # 避免log(0)
-            temp_confidences = np.clip(temp_confidences, 1e-7, 1 - 1e-7)
-            
-            # 负对数似然损失
-            loss = -np.mean(labels * np.log(temp_confidences) + 
-                           (1 - labels) * np.log(1 - temp_confidences))
-            return loss
-        
-        # 在指定范围内搜索最优温度
-        from scipy.optimize import minimize_scalar
-        
-        result = minimize_scalar(
-            temperature_loss,
-            bounds=self.temperature_range,
-            method='bounded'
-        )
-        
-        optimal_temp = result.x if result.success else 1.0
-        
-        # 存储温度参数
-        self.temperature_params[group_key] = optimal_temp
-        
-        return optimal_temp
-    
-    def _apply_temperature_scaling(self, confidences, temperature):
-        """
-        应用温度缩放
-        
-        Args:
-            confidences: 原始置信度
-            temperature: 温度参数
-            
-        Returns:
-            scaled_confidences: 缩放后的置信度
-        """
-        if temperature == 1.0:
-            return confidences
-            
-        # 将置信度转换为logits
-        confidences = np.clip(confidences, 1e-7, 1 - 1e-7)
-        logits = np.log(confidences / (1 - confidences))
-        
-        # 应用温度缩放
-        scaled_logits = logits / temperature
-        
-        # 转换回置信度
-        scaled_confidences = 1 / (1 + np.exp(-scaled_logits))
-        
-        return scaled_confidences
+
 
     def _fit_iso_binned(self, x, y, w=None, n_bins: int = 20):
         s = np.argsort(x)
@@ -491,7 +438,7 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
             self.max_bins = 20
             self.min_bin_size = 50
             self.tail_conf_threshold = adaptive_params["tail_conf_threshold"]
-            self.tail_gate_k = 10.0  # 保持固定
+            self.tail_gate_k = 3.0  # 从10.0降低到3.0，使门控更平滑
             self.tail_wrong_boost = adaptive_params["tail_wrong_boost"]
             self.tail_shrink_alpha = adaptive_params["tail_shrink_alpha"]
             
@@ -510,19 +457,46 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
             self.max_bins = 20
             self.min_bin_size = 50
             self.tail_conf_threshold = self.static_tail_conf_threshold
-            self.tail_gate_k = 10.0
+            self.tail_gate_k = 3.0  # 从10.0降低到3.0，使门控更平滑
             self.tail_wrong_boost = self.static_tail_wrong_boost
             self.tail_shrink_alpha = self.static_tail_shrink_alpha
 
-        # ========= 原有的分桶和等渗逻辑 =========
+        # ========= 改进的自适应分桶策略 =========
         # 自适应分桶：保证每桶有足够样本，降低高段统计方差；
         if self.adaptive_bins:
-            # 根据最小桶大小决定桶数，并限制不超过 max_bins
-            bins_by_size = int(len(xs) // max(self.min_bin_size, 1))
+            # 检查高置信度样本稀疏性
+            high_conf_mask = xs >= self.tail_conf_threshold
+            high_conf_ratio = np.sum(high_conf_mask) / len(xs) if len(xs) > 0 else 0
+            
+            # 如果高置信度样本不足，使用更粗粒度的分桶
+            if high_conf_ratio < 0.1:  # 高置信度样本少于10%
+                # 使用更大的最小桶大小，减少桶数
+                adaptive_min_bin_size = self.min_bin_size * 2
+                print(f"    [自适应分桶] 高置信度样本稀疏({high_conf_ratio:.3f})，使用粗粒度分桶(min_size={adaptive_min_bin_size})")
+            elif high_conf_ratio < 0.2:  # 高置信度样本少于20%
+                adaptive_min_bin_size = int(self.min_bin_size * 1.5)
+                print(f"    [自适应分桶] 高置信度样本较少({high_conf_ratio:.3f})，使用中等粒度分桶(min_size={adaptive_min_bin_size})")
+            else:
+                adaptive_min_bin_size = self.min_bin_size
+            
+            # 根据调整后的最小桶大小决定桶数
+            bins_by_size = int(len(xs) // max(adaptive_min_bin_size, 1))
             bins = max(1, min(self.max_bins, bins_by_size))
         else:
             bins = n_bins
-        edges = np.linspace(0, len(xs), bins + 1).astype(int)
+        
+        # 实现等频分桶替代等宽分桶（在样本稀疏区域提供更好的校准效果）
+        if self.adaptive_bins and len(xs) > bins:
+            # 使用等频分桶：每个桶包含相似数量的样本
+            quantiles = np.linspace(0, 1, bins + 1)
+            edges = np.quantile(range(len(xs)), quantiles).astype(int)
+            # 确保边界不重复
+            edges = np.unique(edges)
+            if len(edges) < bins + 1:
+                # 如果去重后桶数不够，回退到等宽分桶
+                edges = np.linspace(0, len(xs), bins + 1).astype(int)
+        else:
+            edges = np.linspace(0, len(xs), bins + 1).astype(int)
 
         xb, yb, wb = [], [], []
         # 组内先验：用于尾段收缩（有外部样本权重则用加权平均）
@@ -543,6 +517,17 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
             else:
                 w_i = np.ones(b - a, dtype=np.float64)
             wrong = (ys[a:b] < 0.5).astype(np.float64)  # 负例视为"错误"
+            
+            # 数据增强策略：为高置信度稀疏区域增加有效样本权重
+            bin_size = b - a
+            if xmean >= self.tail_conf_threshold and bin_size < self.min_bin_size:
+                # 高置信度且样本稀疏的桶，增加样本权重以提高统计稳定性
+                sparsity_boost = max(1.0, self.min_bin_size / bin_size)  # 根据稀疏程度调整权重
+                sparsity_boost = min(sparsity_boost, 3.0)  # 限制最大提升倍数
+                w_i = w_i * sparsity_boost
+                if self.verbose:
+                    print(f"    [数据增强] 桶{i}(conf={xmean:.3f}, size={bin_size})权重提升{sparsity_boost:.2f}倍")
+            
             w_boost = w_i * (1.0 + self.tail_wrong_boost * gate * wrong)
 
             # 桶内加权平均与总权重
@@ -573,6 +558,205 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
     def _create_high_conf_key2(self, t: int, a: int) -> str:
         """L2: token_type × attn_q (for high confidence)"""
         return f"hc_t{t}_a{a}"
+
+    def _optimize_temperature_for_group(self, logits: np.ndarray, true_labels: np.ndarray, 
+                                       sample_weights: Optional[np.ndarray] = None) -> float:
+        """
+        为特定组优化temperature参数，基于ECE最小化
+        
+        Args:
+            logits: 原始logits (未经过softmax)
+            true_labels: 真实标签 (0/1)
+            sample_weights: 样本权重
+            
+        Returns:
+            float: 最优temperature值
+        """
+        if len(logits) < 50:  # 样本数太少，使用全局默认值
+            return 1.0
+            
+        # 将logits转换为概率（假设是二分类的logits）
+        def logits_to_probs(logits_arr, temp):
+            # 如果logits是单维的，假设是正类的logit
+            if logits_arr.ndim == 1:
+                scaled_logits = logits_arr / temp
+                return 1.0 / (1.0 + np.exp(-scaled_logits))  # sigmoid
+            else:
+                # 如果是多类logits，使用softmax
+                scaled_logits = logits_arr / temp
+                exp_logits = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
+                return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+        
+        # 搜索最优temperature
+        temp_candidates = np.linspace(
+            self.temperature_search_range[0], 
+            self.temperature_search_range[1], 
+            self.temperature_search_steps
+        )
+        
+        best_temp = 1.0
+        best_ece = float('inf')
+        
+        for temp in temp_candidates:
+            try:
+                probs = logits_to_probs(logits, temp)
+                if probs.ndim > 1:
+                    probs = probs[:, 1]  # 取正类概率
+                
+                # 计算ECE
+                ece = self._compute_ece(probs, true_labels, sample_weights, n_bins=10, equal_freq=True)
+                
+                if ece < best_ece:
+                    best_ece = ece
+                    best_temp = temp
+                    
+            except Exception as e:
+                continue  # 跳过有问题的temperature值
+        
+        return best_temp
+
+    def _apply_temperature_scaling(self, logits: np.ndarray, temperature: float) -> np.ndarray:
+        """
+        应用temperature scaling到logits
+        
+        Args:
+            logits: 原始logits
+            temperature: temperature参数
+            
+        Returns:
+            np.ndarray: 经过temperature scaling的概率
+        """
+        if temperature <= 0:
+            temperature = 1.0
+            
+        if logits.ndim == 1:
+            scaled_logits = logits / temperature
+            return 1.0 / (1.0 + np.exp(-scaled_logits))  # sigmoid
+        else:
+            scaled_logits = logits / temperature
+            exp_logits = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
+            return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+
+    def get_group_temperature(self, features) -> float:
+        """
+        根据token特征返回对应组的最优temperature
+        
+        Args:
+            features: 可以是单个数据点字典或包含数组的特征字典
+            
+        Returns:
+            float: 对应的temperature值（单个数据点）或 np.ndarray（多个数据点）
+        """
+        if not self.enable_temperature_scaling or not self.is_fitted:
+            return 1.0
+            
+        # 检查是否为单个数据点
+        if isinstance(features, dict) and 'draft_confidence' in features:
+            # 单个数据点的情况
+            if isinstance(features['draft_confidence'], (int, float)):
+                return self._get_single_temperature(features)
+            
+        # 多个数据点的情况（原有逻辑）
+        proc = self._preprocess_features(features, fit_mode=False)
+        token = proc['token_type']
+        attn = proc['attn_q']
+        pos = proc['pos_bin']
+        margin_q = proc.get('margin_q', np.zeros_like(attn))
+        conf = proc['draft_conf']
+        
+        temperatures = np.ones(len(conf))
+        
+        # 根据置信度选择分组策略
+        high_conf_mask = conf >= self.confidence_threshold
+        
+        for i in range(len(conf)):
+            if high_conf_mask[i]:
+                # 高置信度：使用简化分组
+                key1 = self._create_high_conf_key1(token[i])
+                key2 = self._create_high_conf_key2(token[i], attn[i])
+                
+                if key2 in self.group_temperatures:
+                    temperatures[i] = self.group_temperatures[key2]
+                elif key1 in self.group_temperatures:
+                    temperatures[i] = self.group_temperatures[key1]
+                else:
+                    temperatures[i] = self.global_temperature
+            else:
+                # 低置信度：使用完整分组
+                key4 = self._create_group_key4(token[i], attn[i], pos[i], margin_q[i])
+                key3 = self._create_group_key(token[i], attn[i], pos[i])
+                key2 = self._create_group_key2(token[i], attn[i])
+                key1 = f"t{token[i]}"
+                
+                if key4 in self.group_temperatures:
+                    temperatures[i] = self.group_temperatures[key4]
+                elif key3 in self.group_temperatures:
+                    temperatures[i] = self.group_temperatures[key3]
+                elif key2 in self.group_temperatures:
+                    temperatures[i] = self.group_temperatures[key2]
+                elif key1 in self.group_temperatures:
+                    temperatures[i] = self.group_temperatures[key1]
+                else:
+                    temperatures[i] = self.global_temperature
+                    
+        return temperatures
+    
+    def _get_single_temperature(self, data_point: dict) -> float:
+        """
+        为单个数据点获取temperature值
+        
+        Args:
+            data_point: 单个数据点的特征字典
+            
+        Returns:
+            float: 对应的temperature值
+        """
+        # 转换为数组格式以使用现有的预处理逻辑
+        features_array = {}
+        for key, value in data_point.items():
+            if isinstance(value, (int, float)):
+                features_array[key] = np.array([value])
+            elif isinstance(value, str):
+                features_array[key] = np.array([value])
+            else:
+                features_array[key] = np.array([value])
+        
+        proc = self._preprocess_features(features_array, fit_mode=False)
+        token = proc['token_type'][0]
+        attn = proc['attn_q'][0]
+        pos = proc['pos_bin'][0]
+        margin_q = proc.get('margin_q', np.array([0]))[0]
+        conf = proc['draft_conf'][0]
+        
+        # 根据置信度选择分组策略
+        if conf >= self.confidence_threshold:
+            # 高置信度：使用简化分组
+            key1 = self._create_high_conf_key1(token)
+            key2 = self._create_high_conf_key2(token, attn)
+            
+            if key2 in self.group_temperatures:
+                return self.group_temperatures[key2]
+            elif key1 in self.group_temperatures:
+                return self.group_temperatures[key1]
+            else:
+                return self.global_temperature
+        else:
+            # 低置信度：使用完整分组
+            key4 = self._create_group_key4(token, attn, pos, margin_q)
+            key3 = self._create_group_key(token, attn, pos)
+            key2 = self._create_group_key2(token, attn)
+            key1 = f"t{token}"
+            
+            if key4 in self.group_temperatures:
+                return self.group_temperatures[key4]
+            elif key3 in self.group_temperatures:
+                return self.group_temperatures[key3]
+            elif key2 in self.group_temperatures:
+                return self.group_temperatures[key2]
+            elif key1 in self.group_temperatures:
+                return self.group_temperatures[key1]
+            else:
+                return self.global_temperature
 
     def fit(self, features, soft_labels, hard_labels, sample_weights=None):
         proc = self._preprocess_features(features, fit_mode=True)
@@ -711,12 +895,7 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
             # 高置信度两层分组训练
             self.high_conf_level1, self.high_conf_level2 = {}, {}
             
-            # 为高置信度数据计算全局温度缩放
-            if self.use_temperature_scaling and high_conf_count > 50:
-                high_conf_temp = self._compute_temperature_scaling(
-                    c[high_conf_mask], y[high_conf_mask], "high_conf_global"
-                )
-                print(f"    高置信度全局温度参数: {high_conf_temp:.3f}")
+
             
             # 高置信度 L1: token_type only
             for t in range(3):
@@ -724,13 +903,7 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                 key = self._create_high_conf_key1(t)
                 if idx.sum() >= self.min_samples_per_group:
                     self.high_conf_level1[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
-                    
-                    # 为该分组计算温度缩放参数
-                    if self.use_temperature_scaling and idx.sum() > 20:
-                        temp = self._compute_temperature_scaling(c[idx], y[idx], f"high_conf_{key}")
-                        print(f"    高置信度L1 {key}: {int(idx.sum())} 样本, 温度={temp:.3f}")
-                    else:
-                        print(f"    高置信度L1 {key}: {int(idx.sum())} 样本")
+                    print(f"    高置信度L1 {key}: {int(idx.sum())} 样本")
                 else:
                     self.high_conf_level1[key] = None
             
@@ -741,13 +914,7 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                     key = self._create_high_conf_key2(t, a)
                     if idx.sum() >= self.min_samples_per_group:
                         self.high_conf_level2[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
-                        
-                        # 为该分组计算温度缩放参数
-                        if self.use_temperature_scaling and idx.sum() > 20:
-                            temp = self._compute_temperature_scaling(c[idx], y[idx], f"high_conf_{key}")
-                            print(f"    高置信度L2 {key}: {int(idx.sum())} 样本, 温度={temp:.3f}")
-                        else:
-                            print(f"    高置信度L2 {key}: {int(idx.sum())} 样本")
+                        print(f"    高置信度L2 {key}: {int(idx.sum())} 样本")
                     else:
                         self.high_conf_level2[key] = None
             
@@ -842,6 +1009,90 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                             else:
                                 self.level4[key] = None
 
+        # ========= Temperature Scaling 优化 =========
+        if self.enable_temperature_scaling:
+            print("[GroupedIsotonicCalibrator] 开始为每个组优化temperature参数...")
+            
+            # 注意：这里我们需要原始logits，但当前只有draft_confidence
+            # 作为临时方案，我们使用draft_confidence的logit形式
+            # 在实际应用中，应该传入原始logits
+            draft_logits = np.log(c / (1 - c + 1e-8))  # 将概率转换回logit（近似）
+            
+            # 优化全局temperature
+            self.global_temperature = self._optimize_temperature_for_group(draft_logits, y, w)
+            print(f"  全局最优temperature: {self.global_temperature:.3f}")
+            
+            if self.use_hybrid_grouping:
+                # 高置信度组的temperature优化
+                for t in range(3):
+                    idx = high_conf_mask & (token == t)
+                    if idx.sum() >= 50:  # 最小样本数要求
+                        key = self._create_high_conf_key1(t)
+                        temp = self._optimize_temperature_for_group(draft_logits[idx], y[idx], w[idx] if w is not None else None)
+                        self.group_temperatures[key] = temp
+                        print(f"  高置信度L1 {key}: temperature={temp:.3f}")
+                
+                for t in range(3):
+                    for a in range(5):
+                        idx = high_conf_mask & (token == t) & (attn == a)
+                        if idx.sum() >= 50:
+                            key = self._create_high_conf_key2(t, a)
+                            temp = self._optimize_temperature_for_group(draft_logits[idx], y[idx], w[idx] if w is not None else None)
+                            self.group_temperatures[key] = temp
+                            print(f"  高置信度L2 {key}: temperature={temp:.3f}")
+                
+                # 低置信度组的temperature优化
+                for t in range(3):
+                    idx = low_conf_mask & (token == t)
+                    if idx.sum() >= 50:
+                        key = f"t{t}"
+                        temp = self._optimize_temperature_for_group(draft_logits[idx], y[idx], w[idx] if w is not None else None)
+                        self.group_temperatures[key] = temp
+                        print(f"  低置信度L1 {key}: temperature={temp:.3f}")
+                
+                for t in range(3):
+                    for a in range(5):
+                        idx = low_conf_mask & (token == t) & (attn == a)
+                        if idx.sum() >= 50:
+                            key = self._create_group_key2(t, a)
+                            temp = self._optimize_temperature_for_group(draft_logits[idx], y[idx], w[idx] if w is not None else None)
+                            self.group_temperatures[key] = temp
+                            print(f"  低置信度L2 {key}: temperature={temp:.3f}")
+                
+                for t in range(3):
+                    for a in range(5):
+                        for p in range(2):
+                            idx = low_conf_mask & (token == t) & (attn == a) & (pos == p)
+                            if idx.sum() >= 50:
+                                key = self._create_group_key(t, a, p)
+                                temp = self._optimize_temperature_for_group(draft_logits[idx], y[idx], w[idx] if w is not None else None)
+                                self.group_temperatures[key] = temp
+                                print(f"  低置信度L3 {key}: temperature={temp:.3f}")
+                
+                for t in range(3):
+                    for a in range(5):
+                        for p in range(2):
+                            for m in range(3):
+                                idx = low_conf_mask & (token == t) & (attn == a) & (pos == p) & (margin_q == m)
+                                if idx.sum() >= 50:
+                                    key = self._create_group_key4(t, a, p, m)
+                                    temp = self._optimize_temperature_for_group(draft_logits[idx], y[idx], w[idx] if w is not None else None)
+                                    self.group_temperatures[key] = temp
+                                    print(f"  低置信度L4 {key}: temperature={temp:.3f}")
+            else:
+                # 传统分组的temperature优化
+                for t in range(3):
+                    idx = (token == t)
+                    if idx.sum() >= 50:
+                        key = f"t{t}"
+                        temp = self._optimize_temperature_for_group(draft_logits[idx], y[idx], w[idx] if w is not None else None)
+                        self.group_temperatures[key] = temp
+                        print(f"  L1 {key}: temperature={temp:.3f}")
+                
+                # 其他层级的优化...（类似上面的逻辑）
+            
+            print(f"[GroupedIsotonicCalibrator] Temperature优化完成，共优化了{len(self.group_temperatures)}个组")
+
         self.is_fitted = True
 
     def predict_proba(self, features):
@@ -873,26 +1124,8 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                         or self.global_calibrator
                     )
                     if cal is not None:
-                        # 先进行等渗校准
+                        # 进行等渗校准
                         calibrated_probs = cal.predict(c[mask])
-                        
-                        # 再应用温度缩放（如果启用）
-                        if self.use_temperature_scaling:
-                            # 选择合适的温度参数：优先使用分组特定的，然后是全局的
-                            temp_key_options = [
-                                f"high_conf_{key2}",
-                                f"high_conf_{key1}", 
-                                "high_conf_global"
-                            ]
-                            temperature = 1.0
-                            for temp_key in temp_key_options:
-                                if temp_key in self.temperature_params:
-                                    temperature = self.temperature_params[temp_key]
-                                    break
-                            
-                            # 应用温度缩放
-                            calibrated_probs = self._apply_temperature_scaling(calibrated_probs, temperature)
-                        
                         out[mask] = calibrated_probs
                     else:
                         out[mask] = self.global_mean
@@ -1006,8 +1239,6 @@ def calibrator_training(calibrator_dir: str, json_path: str):
     gi = GroupedIsotonicCalibrator(
         use_hybrid_grouping=True,
         confidence_threshold=0.7,
-        use_temperature_scaling=True,
-        temperature_range=(1.2, 2.5),
         min_samples_per_group=50
     )
     gi.fit(feats, soft, hard)
@@ -1031,5 +1262,5 @@ if __name__ == "__main__":
     # test_calibrator_training()
     # compare_before_after_calibration()
     calibrator_path = "/root/Speculative_decoding/calibration_data/test_calibrators"
-    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_600_val_0_test_900_total_1500_temperature_1/training_calibration_data.json"
+    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_600_val_0_test_900_total_1500_temperature_0/training_calibration_data.json"
     calibrator_training(calibrator_path, json_path)
