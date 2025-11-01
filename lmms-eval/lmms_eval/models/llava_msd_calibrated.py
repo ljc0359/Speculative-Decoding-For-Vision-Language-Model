@@ -66,6 +66,7 @@ class Llava_MSD_Calibrated(lmms):
         batch_size: Optional[Union[int, str]] = 1,
         msd_model: str = None,
         use_msd: bool = False,
+        use_calibration: bool = False,
         model_name=None,
         attn_implementation=best_fit_attn_implementation,
         device_map="auto",
@@ -110,8 +111,7 @@ class Llava_MSD_Calibrated(lmms):
                 low_cpu_mem_usage=True,
                 device_map="auto",
                 total_token=-1,
-                top_k=10,
-                depth=6
+                use_calibration=use_calibration,
         )
 
         self._config = self._model.base_model.config
@@ -352,24 +352,21 @@ class Llava_MSD_Calibrated(lmms):
         # 检查是否已存在训练好的校准器
         calibrator_dir = os.path.join(base_calibration_path, "calibrators")
         isotonic_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
-        monotonic_path = os.path.join(calibrator_dir, "monotonic_network_calibrator.pkl")
 
         calibrator_trained = False
         trained_calibrators = {}
         
         print(f"Isotonic path: {isotonic_path}")
-        print(f"Monotonic path: {monotonic_path}")
         print(os.path.exists(isotonic_path))
-        print(os.path.exists(monotonic_path))
         
-        if os.path.exists(isotonic_path) or os.path.exists(monotonic_path):
+        if os.path.exists(isotonic_path):
             print("\n" + "="*50)
             print("Found existing calibrators! Loading pre-trained calibrators...")
             print(f"  - Isotonic: {isotonic_path}")
             print("="*50)
             
             try:
-                trained_calibrators = self._load_existing_calibrators(isotonic_path, monotonic_path)
+                trained_calibrators = self._load_existing_calibrators(isotonic_path)
                 if trained_calibrators:
                     calibrator_trained = True
                     skip_to_test = True  # 已有校准器，直接跳到测试集
@@ -414,16 +411,7 @@ class Llava_MSD_Calibrated(lmms):
         reset_flag=False
 
         for chunk_idx, chunk in enumerate(chunks_list):
-            # 确定当前chunk属于哪个数据集
-
-            # if skip_to_test == True and chunk_idx <= train_end:
-            #     if chunk_idx % 100 == 0: ## log 
-            #         print(f"[msdgenerate] skipping train sample {chunk_idx}")
-            #     continue
-
             current_sample_idx = chunk_idx  # 假设batch_size=1
-            
-            
             if current_sample_idx < train_end and not skip_to_test:
                 data_phase = "train"
                 train_calibrator_flag = True
@@ -623,9 +611,7 @@ class Llava_MSD_Calibrated(lmms):
         pbar.close()
         
         if CALIBRATION_LOGGING_ENABLED and calibration_logger is not None:
-            # calibration_logger.save_data("test_calibration_data")
-            
-            # 计算ECE并绘制图表 - 使用测试数据
+
             figure_save_path = os.path.join(base_calibration_path, "test_ece_bin_20.png")
             os.makedirs(os.path.dirname(figure_save_path), exist_ok=True)
             
@@ -650,7 +636,8 @@ class Llava_MSD_Calibrated(lmms):
                         "total_samples": int(stats.get("total_samples", 0)),
                         "self.total_accept_len": self.total_accept_len,
                         "self.total_accept_steps": self.total_accept_steps,
-                        "average_acc_per_step": self.total_accept_len / self.total_accept_steps
+                        "average_acc_per_step": self.total_accept_len / self.total_accept_steps,
+                        "ece":  float(stats.get("ece", 0.0))
                     }
 
                     with open(acceptance_file, "w", encoding="utf-8") as f:
@@ -659,7 +646,6 @@ class Llava_MSD_Calibrated(lmms):
                 except Exception as write_err:
                     eval_logger.warning(f"Failed to write acceptance rate summary: {write_err}")
             
-            # 生成跨模态注意力分析图表
             calibration_logger.plot_cross_modal_attention_comprehensive_analysis(
                 save_path=cross_attention_path, 
                 confidence_binning="both"

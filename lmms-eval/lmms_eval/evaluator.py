@@ -53,6 +53,7 @@ def simple_evaluate(
     tasks: Optional[List[Union[str, dict, object]]] = None,
     msd_model=None,
     use_msd=False,
+    use_calibration=False,
     num_fewshot: Optional[int] = None,
     batch_size: Optional[Union[int, str]] = None,
     max_batch_size: Optional[int] = None,

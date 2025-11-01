@@ -232,29 +232,6 @@ def generate_tree_buffers(tree_choices, device="cuda"):
 
     return tree_buffers
 
-
-def initialize_tree0(input_ids, model, past_key_values, logits_processor):
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids, outputs, logits, hidden_state, sample_token = model(
-        input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor
-    )
-
-    #     if logits_processor is not None:
-    #         logits = orig[:, -1]
-    #         logits = logits_processor(None, logits)
-    #         probabilities = torch.nn.functional.softmax(logits, dim=1)
-    #         token = torch.multinomial(probabilities, 1)
-    #     else:
-    #         token = torch.argmax(orig[:, -1])
-    #         token = token[None, None]
-    #     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
-    #     # Clone the output hidden states
-    #
-    #     draft_tokens, retrieve_indices,tree_mask,tree_position_ids = self.ea_layer.topK_genrate(hidden_states, input_ids, self.base_model.lm_head)
-    #     if output_orig:
-    #         return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, outputs, orig, hidden_states, token
-    #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
-    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
-
 def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_embeds=None, enable_candidate_calibration=False, train_calibrator=False,
         use_calibrator=None, calibrator=None 
     ):

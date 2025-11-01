@@ -1,11 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Calibrators for EAGLE draft confidence
-- Grouped Isotonic (with hierarchical fallback)
-- Monotonic MLP (stabilized, hard-label first)
-- Platt scaling baseline
-"""
-
 import os
 import pickle
 from abc import ABC, abstractmethod
@@ -109,6 +101,9 @@ class BaseCalibrator(ABC):
     def _create_group_key(self, token_type: int, attn_q: int, pos_bin: int) -> str:
         return f"t{token_type}_a{attn_q}_p{pos_bin}"
 
+    def _create_group_key2(self, token_type: int, attn_q: int) -> str:
+        return f"t{token_type}_a{attn_q}"
+        
     def _create_group_key4(self, token_type: int, attn_q: int, pos_bin: int, margin_q: int) -> str:
         # 新增的四维键：token_type × attn_q × pos_bin × margin_q
         return f"t{token_type}_a{attn_q}_p{pos_bin}_m{margin_q}"
@@ -210,60 +205,111 @@ class BaseCalibrator(ABC):
 
     @classmethod
     def load(cls, path: str):
+        # 兼容旧 pickle 的命名空间映射
+        class _CompatUnpickler(pickle.Unpickler):
+            def find_class(self_inner, module, name):
+                from eagle.model.calibrators import (
+                    GroupedIsotonicCalibrator,
+                    MonotonicNetworkCalibrator,
+                    MonotonicMLP,
+                )
+                mapping = {
+                    "GroupedIsotonicCalibrator": GroupedIsotonicCalibrator,
+                    "MonotonicNetworkCalibrator": MonotonicNetworkCalibrator,
+                    "MonotonicMLP": MonotonicMLP,
+                    "_AffineMono": MonotonicNetworkCalibrator._AffineMono,
+                    "MonotonicNetworkCalibrator._AffineMono": MonotonicNetworkCalibrator._AffineMono,
+                }
+                if name in mapping and module in (
+                    "lmms_eval.__main__",
+                    "__main__",
+                    "eagle.model.calibrators",
+                ):
+                    return mapping[name]
+                if name.endswith("._AffineMono"):
+                    return MonotonicNetworkCalibrator._AffineMono
+                if name in mapping:
+                    return mapping[name]
+                return super(_CompatUnpickler, self_inner).find_class(module, name)
+
         with open(path, 'rb') as f:
-            return pickle.load(f)
+            return _CompatUnpickler(f).load()
 
 # =========================
 # Grouped Isotonic
 # =========================
 
+# 新增：Beta 参数化校准器（Kull et al., 2017）
+class BetaCalibrator:
+    """Beta calibration for binary probabilities.
+    使用 LogisticRegression 在特征 [log(s), log(1-s)] 上拟合，输出为 P(y=1|s)。
+    """
+    def __init__(self):
+        self.model = LogisticRegression(solver='lbfgs', max_iter=1000)
+        self.is_fitted = False
+
+    def fit(self, x, y, w=None):
+        s = np.clip(np.asarray(x, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+        X = np.column_stack([np.log(s), np.log1p(-s)])
+        self.model.fit(X, np.asarray(y), sample_weight=(np.asarray(w) if w is not None else None))
+        self.is_fitted = True
+        return self
+
+    def predict(self, x):
+        assert self.is_fitted, "BetaCalibrator must be fitted before predict."
+        s = np.clip(np.asarray(x, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+        X = np.column_stack([np.log(s), np.log1p(-s)])
+        return self.model.predict_proba(X)[:, 1]
+
 class GroupedIsotonicCalibrator(BaseCalibrator):
     """12 组 Isotonic：token_type × attn_q × pos_bin，层级回退"""
 
-    def __init__(self, min_samples_per_group: int = 200,
+    def __init__(self, min_samples_per_group: int = 100,  # 从200降低到100，适应稀疏数据
                  out_of_bounds: str = 'clip',
-                 target: str = 'hard'):
+                 target: str = 'soft',
+                 min_samples_for_beta: int = 50
+                 ):
         super().__init__()
         self.min_samples_per_group = min_samples_per_group
         self.out_of_bounds = out_of_bounds
         self.target = target  # 'hard' or 'soft'
-        self.level1, self.level2, self.level3 = {}, {}, {}
+        self.min_samples_for_beta = min_samples_for_beta
+        self.level1, self.level2, self.level3, self.level4 = {}, {}, {}, {}
+        self.verbose = True
+        self.beta_used_groups = []
+        
         self.global_calibrator = None
         self.global_mean = None
 
-    def _fit_iso_binned(self, x, y, w=None, n_bins: int = 20):
-        s = np.argsort(x)
-        xs, ys = x[s], y[s]
-        ws = w[s] if w is not None else None
-        # 等频分桶
-        edges = np.linspace(0, len(xs), n_bins + 1).astype(int)
-        xb, yb, wb = [], [], []
-        for i in range(n_bins):
-            a, b = edges[i], edges[i + 1]
-            if b <= a:
-                continue
-            if ws is not None:
-                w_i = ws[a:b]
-                xb.append(float(xs[a:b].mean()))
-                yb.append(float(np.average(ys[a:b], weights=w_i)))
-                wb.append(float(w_i.sum()))
-            else:
-                xb.append(float(xs[a:b].mean()))
-                yb.append(float(ys[a:b].mean()))
-                wb.append(float(b - a))
+    def _fit_iso_binned(self, x, y, w=None, n_bins: int = 20, group_key: str = "unknown"):
+        # 简化版：直接在原始对 (confidence, label) 上拟合单调等概率校准器；不进行权重操控、尾部收缩或数据增强
         iso = IsotonicRegression(out_of_bounds=self.out_of_bounds, increasing=True)
-        iso.fit(np.array(xb), np.array(yb), sample_weight=np.array(wb))
+        iso.fit(np.asarray(x), np.asarray(y), sample_weight=np.asarray(w) if w is not None else None)
         return iso
+
+    # 新增：Beta 回退拟合
+    def _fit_beta_calibrator(self, x, y, w=None, group_key: str = "unknown"):
+        beta = BetaCalibrator().fit(x, y, w)
+        return beta
+
+
+    def _create_group_key5(self, t: int, a: int, p: int, m: int, b: int) -> str:
+        return f"t{t}_a{a}_p{p}_m{m}_b{b}"
 
     def fit(self, features, soft_labels, hard_labels, sample_weights=None):
         proc = self._preprocess_features(features, fit_mode=True)
         c = proc['draft_conf']
-        token, attn, pos = proc['token_type'], proc['attn_q'], proc['pos_bin']
-        # 新增 margin_q 维度
-        margin_q = proc['margin_q']
-
+        token = proc['token_type']
+        attn = proc['attn_q']
+        pos = proc['pos_bin']
+        margin_q = proc.get('margin_q', np.zeros_like(attn))
+        
         y = hard_labels if self.target == 'hard' else soft_labels
         w = sample_weights
+
+        # ========= 数据增强（禁用） =========
+        # 根据需求移除所有数据增强与标签混合逻辑，训练严格使用原始数据
+        # self.enable_augmentation 已默认 False，不再进行任何增强/混合处理
 
         # ========= 训练数据统计与诊断输出 =========
         try:
@@ -280,7 +326,7 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                 return stats
 
             soft_stats = _safe_stats(np.asarray(soft_labels), percentiles=(95, 99))
-            hard_pos_rate = float(np.mean(hard_labels)) if len(hard_labels) > 0 else float('nan')
+            hard_pos_rate = float(np.mean(y)) if len(y) > 0 else float('nan')
             conf_stats = _safe_stats(np.asarray(c), percentiles=(95,))
             print("[GroupedIsotonicCalibrator] 训练数据统计 - 全局")
             print(f"  soft_labels: count={soft_stats.get('count', 0)}, "
@@ -304,15 +350,13 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                 if cnt == 0:
                     print(f"  t{t}: count=0")
                     continue
-                soft_s = _safe_stats(np.asarray(soft_labels)[idx], percentiles=(95, 99))
-                hard_rate = float(np.mean(np.asarray(hard_labels)[idx]))
+                hard_rate = float(np.mean(np.asarray(y)[idx]))
                 conf_s = _safe_stats(np.asarray(c)[idx], percentiles=(95,))
                 print(f"  t{t}: count={cnt}, "
-                      f"soft[max={soft_s.get('max'):.4f}, p95={soft_s.get('p95'):.4f}, p99={soft_s.get('p99'):.4f}, mean={soft_s.get('mean'):.4f}], "
                       f"hard_pos={hard_rate:.4f}, "
                       f"conf[max={conf_s.get('max'):.4f}, p95={conf_s.get('p95'):.4f}]")
 
-            # L2: token_type × attn_q (5 组)
+            # L2: token_type × attn_q
             print("[GroupedIsotonicCalibrator] 分组统计 - L2(token_type × attn_q)")
             for t in range(3):
                 for a in range(5):
@@ -322,11 +366,9 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                     if cnt == 0:
                         print(f"  {key}: count=0")
                         continue
-                    soft_s = _safe_stats(np.asarray(soft_labels)[idx], percentiles=(95, 99))
-                    hard_rate = float(np.mean(np.asarray(hard_labels)[idx]))
+                    hard_rate = float(np.mean(np.asarray(y)[idx]))
                     conf_s = _safe_stats(np.asarray(c)[idx], percentiles=(95,))
                     print(f"  {key}: count={cnt}, "
-                          f"soft[max={soft_s.get('max'):.4f}, p95={soft_s.get('p95'):.4f}, p99={soft_s.get('p99'):.4f}, mean={soft_s.get('mean'):.4f}], "
                           f"hard_pos={hard_rate:.4f}, "
                           f"conf[max={conf_s.get('max'):.4f}, p95={conf_s.get('p95'):.4f}]")
 
@@ -335,17 +377,15 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
             for t in range(3):
                 for a in range(5):
                     for p in range(2):
-                        key3 = self._create_group_key(t, a, p)
+                        key = self._create_group_key(t, a, p)
                         idx = (token == t) & (attn == a) & (pos == p)
                         cnt = int(idx.sum())
                         if cnt == 0:
-                            print(f"  {key3}: count=0")
+                            print(f"  {key}: count=0")
                             continue
-                        soft_s = _safe_stats(np.asarray(soft_labels)[idx], percentiles=(95, 99))
-                        hard_rate = float(np.mean(np.asarray(hard_labels)[idx]))
+                        hard_rate = float(np.mean(np.asarray(y)[idx]))
                         conf_s = _safe_stats(np.asarray(c)[idx], percentiles=(95,))
-                        print(f"  {key3}: count={cnt}, "
-                              f"soft[max={soft_s.get('max'):.4f}, p95={soft_s.get('p95'):.4f}, p99={soft_s.get('p99'):.4f}, mean={soft_s.get('mean'):.4f}], "
+                        print(f"  {key}: count={cnt}, "
                               f"hard_pos={hard_rate:.4f}, "
                               f"conf[max={conf_s.get('max'):.4f}, p95={conf_s.get('p95'):.4f}]")
 
@@ -355,17 +395,15 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                 for a in range(5):
                     for p in range(2):
                         for m in range(3):
-                            key4 = self._create_group_key4(t, a, p, m)
+                            key = self._create_group_key4(t, a, p, m)
                             idx = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
                             cnt = int(idx.sum())
                             if cnt == 0:
-                                print(f"  {key4}: count=0")
+                                print(f"  {key}: count=0")
                                 continue
-                            soft_s = _safe_stats(np.asarray(soft_labels)[idx], percentiles=(95, 99))
-                            hard_rate = float(np.mean(np.asarray(hard_labels)[idx]))
+                            hard_rate = float(np.mean(np.asarray(y)[idx]))
                             conf_s = _safe_stats(np.asarray(c)[idx], percentiles=(95,))
-                            print(f"  {key4}: count={cnt}, "
-                                  f"soft[max={soft_s.get('max'):.4f}, p95={soft_s.get('p95'):.4f}, p99={soft_s.get('p99'):.4f}, mean={soft_s.get('mean'):.4f}], "
+                            print(f"  {key}: count={cnt}, "
                                   f"hard_pos={hard_rate:.4f}, "
                                   f"conf[max={conf_s.get('max'):.4f}, p95={conf_s.get('p95'):.4f}]")
         except Exception as e:
@@ -375,40 +413,55 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         self.global_calibrator = self._fit_iso_binned(c, y, w, n_bins=20)
         self.global_mean = float(np.average(y, weights=w) if w is not None else np.mean(y))
 
-        # L1
-        self.level1 = {}
+        # 统一使用四层分组策略
+        print(f"[GroupedIsotonicCalibrator] 使用统一四层分组策略")
+        
+        # 初始化四层分组存储
+        self.level1, self.level2, self.level3, self.level4 = {}, {}, {}, {}
+        
+        # L1: token_type only
         for t in range(3):
             idx = (token == t)
+            key = f"t{t}"
             if idx.sum() >= self.min_samples_per_group:
-                self.level1[f"t{t}"] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                print(f"    L1 {key}: {int(idx.sum())} 样本")
+                self.level1[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+            elif idx.sum() >= self.min_samples_for_beta:
+                print(f"    L1 {key}: {int(idx.sum())} 样本 -> 使用 Beta 回退")
+                self.level1[key] = self._fit_beta_calibrator(c[idx], y[idx], w[idx] if w is not None else None, group_key=key)
+                self.beta_used_groups.append(f"L1:{key}")
             else:
-                self.level1[f"t{t}"] = None
-
-        # L2
-        self.level2 = {}
+                self.level1[key] = None
+        # L2: token_type × attn_q
         for t in range(3):
             for a in range(5):
                 idx = (token == t) & (attn == a)
                 key = f"t{t}_a{a}"
                 if idx.sum() >= self.min_samples_per_group:
+                    print(f"    L2 {key}: {int(idx.sum())} 样本")
                     self.level2[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                elif idx.sum() >= self.min_samples_for_beta:
+                    print(f"    L2 {key}: {int(idx.sum())} 样本 -> 使用 Beta 回退")
+                    self.level2[key] = self._fit_beta_calibrator(c[idx], y[idx], w[idx] if w is not None else None, group_key=key)
+                    self.beta_used_groups.append(f"L2:{key}")
                 else:
                     self.level2[key] = None
-
-        # L3
-        self.level3 = {}
+        # L3: token_type × attn_q × pos_bin
         for t in range(3):
             for a in range(5):
                 for p in range(2):
                     key = self._create_group_key(t, a, p)
                     idx = (token == t) & (attn == a) & (pos == p)
                     if idx.sum() >= self.min_samples_per_group:
+                        print(f"    L3 {key}: {int(idx.sum())} 样本")
                         self.level3[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                    elif idx.sum() >= self.min_samples_for_beta:
+                        print(f"    L3 {key}: {int(idx.sum())} 样本 -> 使用 Beta 回退")
+                        self.level3[key] = self._fit_beta_calibrator(c[idx], y[idx], w[idx] if w is not None else None, group_key=key)
+                        self.beta_used_groups.append(f"L3:{key}")
                     else:
                         self.level3[key] = None
-
-        # L4
-        self.level4 = {}
+        # L4: token_type × attn_q × pos_bin × margin_q
         for t in range(3):
             for a in range(5):
                 for p in range(2):
@@ -416,9 +469,21 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                         key = self._create_group_key4(t, a, p, m)
                         idx = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
                         if idx.sum() >= self.min_samples_per_group:
+                            print(f"    L4 {key}: {int(idx.sum())} 样本")
                             self.level4[key] = self._fit_iso_binned(c[idx], y[idx], w[idx] if w is not None else None)
+                        elif idx.sum() >= self.min_samples_for_beta:
+                            print(f"    L4 {key}: {int(idx.sum())} 样本 -> 使用 Beta 回退")
+                            self.level4[key] = self._fit_beta_calibrator(c[idx], y[idx], w[idx] if w is not None else None, group_key=key)
+                            self.beta_used_groups.append(f"L4:{key}")
                         else:
                             self.level4[key] = None
+        # 训练结束总结打印
+        if len(self.beta_used_groups) > 0:
+            print("[GroupedIsotonicCalibrator] 以下分组采用了 Beta 参数化回退:")
+            for g in self.beta_used_groups:
+                print(f"  - {g}")
+        else:
+            print("[GroupedIsotonicCalibrator] 所有分组均使用 Isotonic 校准，无需 Beta 回退。")
 
         self.is_fitted = True
 
@@ -429,6 +494,8 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         margin_q = proc['margin_q']
 
         out = np.zeros_like(c, dtype=np.float32)
+        
+        # 统一使用四层分组策略
         for t in range(3):
             for a in range(5):
                 for p in range(2):
@@ -441,7 +508,7 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                         key2 = f"t{t}_a{a}"
                         key1 = f"t{t}"
                         cal = (
-                            (self.level4.get(key4) if hasattr(self, 'level4') else None)
+                            self.level4.get(key4)
                             or self.level3.get(key3)
                             or self.level2.get(key2)
                             or self.level1.get(key1)
@@ -452,10 +519,6 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
                         else:
                             out[mask] = self.global_mean
         return np.clip(out, 1e-4, 1 - 1e-4)
-
-# =========================
-# Data loader + quick tests
-# =========================
 
 def load_calibration_data(path: str) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
     if path.endswith('.json'):
@@ -491,19 +554,18 @@ def _print_metrics(name: str, metrics: Dict[str, float]):
         if k in metrics:
             print(f"  {k}: {metrics[k]:.6f}")
 
-
 def calibrator_training(calibrator_dir: str, json_path: str):
     """
-    训练 Grouped Isotonic 校准器并保存到指定目录。
+    训练 Grouped Isotonic 与 Monotonic Network 两种校准器并保存到指定目录。
     参数:
         calibrator_dir: 输出保存目录（若不存在会创建）
         json_path: 训练数据 JSON 文件路径（需包含 features/soft_labels/hard_labels）
     返回:
-        训练好的 GroupedIsotonicCalibrator 实例
+        (GroupedIsotonicCalibrator, MonotonicNetworkCalibrator)
     """
     set_seed(42)
     print("=" * 60)
-    print(f"[Calibrator] Training Grouped Isotonic from JSON: {json_path}")
+    print(f"[Calibrator] Training Grouped Isotonic & Monotonic Network from JSON: {json_path}")
     print("=" * 60)
 
     # 加载数据
@@ -512,84 +574,32 @@ def calibrator_training(calibrator_dir: str, json_path: str):
     print(f"[Calibrator] Loaded {n} samples; pos_rate={hard.mean():.4f}")
     print(f"[Calibrator] Feature keys: {list(feats.keys())}")
 
-    # 训练 Isotonic（硬标签）
-    gi = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard')
-    gi.fit(feats, soft, hard)
-
-    # 评估并保存
-    metrics = gi.evaluate(feats, soft, hard)
     os.makedirs(calibrator_dir, exist_ok=True)
-    model_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
-    metrics_path = os.path.join(calibrator_dir, "grouped_isotonic_metrics.json")
-    gi.save(model_path)
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
 
-    print(f"[Calibrator] Saved Isotonic calibrator to: {model_path}")
-    print(f"[Calibrator] Saved training metrics to: {metrics_path}")
-    return gi
-
-def test_calibrator_training():
-    set_seed(42)
-    data_path = "/root/Speculative_decoding/calibration_data/chartqa_train_40_val_0_test_60_total_100/non_calibrator/training_calibration_data.json"
-    print("=" * 60)
-    print("Testing Calibrator Training Pipeline (JSON)")
-    print("=" * 60)
-    feats, soft, hard = load_calibration_data(data_path)
-    n = len(soft)
-    print(f"Loaded {n} samples; pos_rate={hard.mean():.4f}")
-    print(f"Feature keys: {list(feats.keys())}")
-
-    # baseline
-    base_pred = np.clip(feats['draft_confidence'], 1e-6, 1 - 1e-6)
-    base_metrics = {
-        'brier': brier_score_loss(hard, base_pred),
-        'ece_eqfreq20': BaseCalibrator._compute_ece(base_pred, hard, None, 20, True),
-        'soft_mse': float(np.mean((base_pred - soft) ** 2)),
-        'auroc': roc_auc_score(hard, base_pred)
-    }
-    _print_metrics("BASELINE (draft_conf)", base_metrics)
-
-    # Platt
-    pl = PlattCalibrator(target='hard')
-    pl.fit(feats, soft, hard)
-    _print_metrics("PLATT (hard)", pl.evaluate(feats, soft, hard))
-
-    # Grouped Isotonic（硬标签）
-    gi = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard')
+    # 训练 Isotonic（硬标签）
+    gi = GroupedIsotonicCalibrator(
+        min_samples_per_group=500,
+    )
     gi.fit(feats, soft, hard)
-    _print_metrics("Grouped Isotonic (hard)", gi.evaluate(feats, soft, hard))
+    metrics_gi = gi.evaluate(feats, soft, hard)
+    gi_model_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
+    gi_metrics_path = os.path.join(calibrator_dir, "grouped_isotonic_metrics.json")
+    gi.save(gi_model_path)
+    with open(gi_metrics_path, "w") as f:
+        json.dump(metrics_gi, f, indent=2)
+    print(f"[Calibrator] Saved Isotonic calibrator to: {gi_model_path}")
+    print(f"[Calibrator] Saved training metrics to: {gi_metrics_path}")
 
-    # Monotonic（硬标签主导）
-    mono = MonotonicNetworkCalibrator(hidden_dim=32, n_basis=6, alpha_soft=0.0,
-                                      max_epochs=200, patience=20, device='cpu')
-    mono.fit(feats, soft, hard)
-    _print_metrics("Monotonic MLP (hard-dominant)", mono.evaluate(feats, soft, hard))
+    # 设备检查：若有 GPU 则用 CUDA，否则用 CPU
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"[Calibrator] Using device for Monotonic Network: {device}")
 
-    print("\n✓ Calibrator pipeline finished.")
-
-
-def compare_before_after_calibration():
-    set_seed(42)
-    data_path = "/root/Speculative_decoding/calibration_data/chartqa_train_40_val_0_test_60_total_100/non_calibrator/training_calibration_data.json"
-    feats, soft, hard = load_calibration_data(data_path)
-
-    base_pred = np.clip(feats['draft_confidence'], 1e-6, 1 - 1e-6)
-    print("\nBaseline Brier:", brier_score_loss(hard, base_pred))
-
-    pl = PlattCalibrator(target='hard'); pl.fit(feats, soft, hard)
-    gi = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard'); gi.fit(feats, soft, hard)
-    mono = MonotonicNetworkCalibrator(hidden_dim=32, n_basis=6, alpha_soft=0.0,
-                                      max_epochs=200, patience=20, device='cpu'); mono.fit(feats, soft, hard)
-
-    for name, cal in [("Platt", pl), ("Isotonic", gi), ("Monotonic", mono)]:
-        m = cal.evaluate(feats, soft, hard)
-        _print_metrics(name, m)
+    return gi, None
 
 
 if __name__ == "__main__":
     # test_calibrator_training()
     # compare_before_after_calibration()
     calibrator_path = "/root/Speculative_decoding/calibration_data/test_calibrators"
-    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_1000_val_0_test_1500_total_2500/training_calibration_data.json"
+    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_600_val_0_test_900_total_1500_temperature_0/training_calibration_data.json"
     calibrator_training(calibrator_path, json_path)

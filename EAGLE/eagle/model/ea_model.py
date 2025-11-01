@@ -18,10 +18,6 @@ from .kv_cache import initialize_past_key_values
 # Model will be selected dynamically in EaModel based on `use_talon`
 from .configs import EConfig, Qwen2VLConfig
 
-
-
-
-
 class EaModel(nn.Module):
 
     def __init__(
@@ -102,12 +98,15 @@ class EaModel(nn.Module):
             base_model_path=None,
             ea_model_path=None,
             total_token=59,
-            depth=4,
-            top_k=8,
+            depth=5,
+            top_k=10,
             threshold=1.0,
             use_talon: bool = False,
             **kwargs,
-    ):
+    ):  
+        # Remove use_calibration from kwargs to prevent it from being passed to model initialization
+        kwargs.pop('use_calibration', None)
+        
         #assert Type=="LLaMA" or "Mixtral"
         Type=AutoConfig.from_pretrained(base_model_path, trust_remote_code=True).architectures[0]
         if Type=='LlamaForCausalLM':
@@ -153,8 +152,6 @@ class EaModel(nn.Module):
             use_talon=use_talon,
             **kwargs
         )
-
-
 
         if total_token==-1:
             try:
@@ -312,13 +309,11 @@ class EaModel(nn.Module):
 
         new_token = 0
 
+        # print("max_length", max_length)
         for idx in range(max_length):
-            #with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens=draft_tokens.to(input_ids.device)
-            #with Timer("tree_decoding"):
-            
             # 根据是否启用attention记录来调用tree_decoding
             if enable_attention_logging and CALIBRATION_LOGGING_ENABLED:
                 logits, hidden_state_new, outputs, attentions = tree_decoding(
@@ -358,6 +353,8 @@ class EaModel(nn.Module):
                     best_candidate=best_candidate
                 )
 
+            # print(f"new accpet_length: {accept_length}")
+
             self.acclen += accept_length
             self.accnum += 1
 
@@ -385,12 +382,16 @@ class EaModel(nn.Module):
             )
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                # print("break 1")
                 break
             if hasattr(self.tokenizer, 'eod_id') and self.tokenizer.eod_id in input_ids[0, input_len:].tolist():
+                # print("break 2")
                 break
             if new_token > max_new_tokens:
+                # print("break 3")
                 break
             if input_ids.shape[1] > max_length:
+                # print("break 4")
                 break
         
         if not log:
@@ -469,12 +470,16 @@ class EaModel(nn.Module):
             new_token+=1
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                print("break 1")
                 break
             if hasattr(self.tokenizer, 'eod_id') and self.tokenizer.eod_id in input_ids[0, input_len:].tolist():
+                print("break 2")
                 break
             if new_token > max_new_tokens:
+                print("break 3")
                 break
             if input_ids.shape[1] > max_length:
+                print("break 4")
                 break
         if not log:
             return input_ids

@@ -112,6 +112,12 @@ def parse_eval_args() -> argparse.Namespace:
         help="If True, use msd for inference",
     )
     parser.add_argument(
+        "--use_calibration",
+        action="store_true",
+        default=False,
+        help="If True, use msd for inference",
+    )
+    parser.add_argument(
         "--batch_size",
         "-b",
         type=str,
@@ -503,6 +509,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         model_args=args.model_args,
         msd_model=args.msd_model_path,
         use_msd=args.use_msd,
+        use_calibration=args.use_calibration,
         tasks=task_names,
         num_fewshot=args.num_fewshot,
         batch_size=args.batch_size,
