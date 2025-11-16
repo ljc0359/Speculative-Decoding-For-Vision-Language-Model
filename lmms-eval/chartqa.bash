@@ -47,9 +47,8 @@ python -m lmms_eval \
   --msd_model_path /root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-7B \
   --tasks chartqa \
   --batch_size 1 \
-  --gen_kwargs temperature=0 \
+  --gen_kwargs temperature=0,train_ratio=0 \
   --use_msd \
   --use_calibration \
   --log_samples \
   --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/chartqa.json \
-  --bottom 1500

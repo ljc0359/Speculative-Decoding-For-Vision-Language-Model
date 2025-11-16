@@ -82,6 +82,7 @@ def simple_evaluate(
     datetime_str: str = get_datetime_str(),
     cli_args=None,
     bottom: Optional[int] = None,  # 新增参数
+    train_ratio: Optional[float] = None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -270,6 +271,7 @@ def simple_evaluate(
         verbosity=verbosity,
         cli_args=cli_args,
         bottom=bottom,  # 新增：传递 bottom
+        train_ratio=train_ratio,
     )
 
     if hasattr(lm, "_model"):
@@ -301,6 +303,7 @@ def simple_evaluate(
                 "use_cache": use_cache,
                 "limit": limit,
                 "bottom": bottom,  # 新增：记录 bottom
+                "train_ratio": train_ratio,  # 新增：记录 train_ratio
                 "bootstrap_iters": bootstrap_iters,
                 "gen_kwargs": gen_kwargs,
                 "random_seed": random_seed,
@@ -337,6 +340,7 @@ def evaluate(
     verbosity: str = "INFO",
     cli_args=None,
     bottom: Optional[int] = None,  # 新增参数
+    train_ratio: Optional[float] = None,  # 新增：与 bottom 同风格的参数
 ):
     """Instantiate and evaluate a model on a list of tasks.
 

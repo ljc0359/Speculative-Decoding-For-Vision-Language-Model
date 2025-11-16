@@ -159,6 +159,13 @@ def parse_eval_args() -> argparse.Namespace:
         default=None,
         help="Select only the last X examples per task (mutually exclusive with --limit).",
     )
+    # 新增：按 bottom 的风格增加 train_ratio 参数（0-1）
+    parser.add_argument(
+        "--train_ratio",
+        type=float,
+        default=0.2,
+        help="Ratio of training samples to use per task [0,1].",
+    )
     parser.add_argument(
         "--use_cache",
         "-c",
@@ -533,6 +540,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         torch_random_seed=args.seed[2],
         fewshot_random_seed=args.seed[3],
         bottom=args.bottom,
+        train_ratio=args.train_ratio,  # 新增：传递 train_ratio
         cli_args=args,
         datetime_str=datetime_str,
         **request_caching_args,

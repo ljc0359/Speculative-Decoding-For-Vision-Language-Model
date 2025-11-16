@@ -1243,7 +1243,7 @@ class CalibrationLogger:
         
         return save_path, {'oce': oce, 'uce': uce, 'ece': oce + uce}
 
-    def get_calibration_stats(self, num_bins: int = 20, save_figure: bool = True, figure_path: str = None):
+    def get_calibration_stats(self, num_bins: int = 20, save_figure: bool = False, figure_path: str = None):
         """
         计算校准统计数据并绘制acceptance rate和confidence的图
         

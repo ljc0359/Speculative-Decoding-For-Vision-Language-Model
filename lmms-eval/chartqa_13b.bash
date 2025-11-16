@@ -1,0 +1,16 @@
+# ==== Inject HuggingFace token (DO NOT COMMIT SECRETS) ====
+export HUGGINGFACE_HUB_TOKEN="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"
+export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
+
+python -m lmms_eval \
+  --model llava_msd_calibrated \
+  --model_args pretrained="/root/Speculative_decoding/checkpoint/llava-v1.5-13b" \
+  --msd_model_path /root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-13B \
+  --tasks chartqa \
+  --batch_size 1 \
+  --gen_kwargs temperature=1 \
+  --use_msd \
+  --use_calibration \
+  --log_samples \
+  --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/chartqa.json \
+  --bottom 1500

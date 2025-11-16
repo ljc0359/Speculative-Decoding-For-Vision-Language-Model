@@ -9,8 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.metrics import brier_score_loss, roc_auc_score, log_loss
+
 import json
+import time
 
 # =========================
 # Utilities & base class
@@ -245,13 +247,15 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
     def __init__(self, min_samples_per_group: int = 100,  # 从200降低到100，适应稀疏数据
                  out_of_bounds: str = 'clip',
                  target: str = 'hard',
-                 use_adaptive_params: bool = False
+                 use_adaptive_params: bool = False,
+                 max_grouping_level: int = 2  # 控制最大分组层级：1=token_type, 2=token_type+attn, 3=+pos_bin, 4=+margin_q
                  ):
         super().__init__()
         self.min_samples_per_group = min_samples_per_group
         self.out_of_bounds = out_of_bounds
         self.target = target  # 'hard' or 'soft'
         self.use_adaptive_params = use_adaptive_params
+        self.max_grouping_level = max_grouping_level
         self.level1, self.level2, self.level3, self.level4 = {}, {}, {}, {}
         self.verbose = True
         
@@ -441,34 +445,121 @@ class GroupedIsotonicCalibrator(BaseCalibrator):
         token, attn, pos = proc['token_type'], proc['attn_q'], proc['pos_bin']
         margin_q = proc['margin_q']
 
+        # 有效置信度掩码：过滤 NaN/Inf 以及越界值
+        mask_valid = np.isfinite(c)
+        mask_valid &= (c >= 0.0) & (c <= 1.0)
+
         out = np.zeros_like(c, dtype=np.float32)
         
-        # 统一使用四层分组策略
-        for t in range(3):
-            for a in range(5):
-                for p in range(2):
-                    for m in range(3):
-                        mask = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
-                        if mask.sum() == 0:
+        # 根据max_grouping_level控制分组策略
+        if self.max_grouping_level >= 4:
+            # 使用四层分组策略
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        for m in range(3):
+                            mask = (token == t) & (attn == a) & (pos == p) & (margin_q == m)
+                            mask_group = mask & mask_valid
+                            if mask_group.sum() == 0:
+                                continue
+                            key4 = self._create_group_key4(t, a, p, m)
+                            key3 = self._create_group_key(t, a, p)
+                            key2 = f"t{t}_a{a}"
+                            key1 = f"t{t}"
+                            cal = (
+                                self.level4.get(key4)
+                                or self.level3.get(key3)
+                                or self.level2.get(key2)
+                                or self.level1.get(key1)
+                                or self.global_calibrator
+                            )
+                            if cal is not None:
+                                try:
+                                    out[mask_group] = cal.predict(c[mask_group])
+                                except Exception:
+                                    out[mask_group] = self.global_mean
+                            else:
+                                out[mask_group] = self.global_mean
+        elif self.max_grouping_level == 3:
+            # 使用三层分组策略（token_type + attn + pos_bin）
+            for t in range(3):
+                for a in range(5):
+                    for p in range(2):
+                        mask = (token == t) & (attn == a) & (pos == p)
+                        mask_group = mask & mask_valid
+                        if mask_group.sum() == 0:
                             continue
-                        key4 = self._create_group_key4(t, a, p, m)
                         key3 = self._create_group_key(t, a, p)
                         key2 = f"t{t}_a{a}"
                         key1 = f"t{t}"
                         cal = (
-                            self.level4.get(key4)
-                            or self.level3.get(key3)
+                            self.level3.get(key3)
                             or self.level2.get(key2)
                             or self.level1.get(key1)
                             or self.global_calibrator
                         )
                         if cal is not None:
-                            out[mask] = cal.predict(c[mask])
+                            try:
+                                out[mask_group] = cal.predict(c[mask_group])
+                            except Exception:
+                                out[mask_group] = self.global_mean
                         else:
-                            out[mask] = self.global_mean
+                            out[mask_group] = self.global_mean
+        elif self.max_grouping_level == 2:
+            # 使用二层分组策略（token_type + attn）
+            for t in range(3):
+                for a in range(5):
+                    mask = (token == t) & (attn == a)
+                    mask_group = mask & mask_valid
+                    if mask_group.sum() == 0:
+                        continue
+                    key2 = f"t{t}_a{a}"
+                    key1 = f"t{t}"
+                    cal = (
+                        self.level2.get(key2)
+                        or self.level1.get(key1)
+                        or self.global_calibrator
+                    )
+                    if cal is not None:
+                        try:
+                            out[mask_group] = cal.predict(c[mask_group])
+                        except Exception:
+                            out[mask_group] = self.global_mean
+                    else:
+                        out[mask_group] = self.global_mean
+        else:  # max_grouping_level == 1
+            # 使用一层分组策略（仅token_type）
+            for t in range(3):
+                mask = (token == t)
+                mask_group = mask & mask_valid
+                if mask_group.sum() == 0:
+                    continue
+                key1 = f"t{t}"
+                cal = (
+                    self.level1.get(key1)
+                    or self.global_calibrator
+                )
+                if cal is not None:
+                    try:
+                        out[mask_group] = cal.predict(c[mask_group])
+                    except Exception:
+                        out[mask_group] = self.global_mean
+                else:
+                    out[mask_group] = self.global_mean
+        
+        # 对无效置信度（NaN/Inf/越界）的样本使用全局均值回退
+        out[~mask_valid] = self.global_mean
+        # 最终数值清理与裁剪
+        out = np.nan_to_num(out, nan=self.global_mean, posinf=1.0, neginf=0.0)
         return np.clip(out, 1e-4, 1 - 1e-4)
 
 def load_calibration_data(path: str) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """
+    加载校准数据，计算基于speculative decoding公式的真实接受率
+    
+    接受概率公式: acceptance_prob = min(1, p_base(token) / p_draft(token))
+    其中 p_base 和 p_draft 是概率值（不是logits）
+    """
     if path.endswith('.json'):
         raw = json.load(open(path, 'r'))
         data = raw['candidate_calibration_data'] if isinstance(raw, dict) and 'candidate_calibration_data' in raw else raw
@@ -478,19 +569,226 @@ def load_calibration_data(path: str) -> Tuple[Dict[str, np.ndarray], np.ndarray,
         for k in keys:
             if k in data[0]:
                 feats[k] = np.array([x[k] for x in data])
-        soft = np.array([x['base_confidence'] for x in data])
+        
+        # 计算基于speculative decoding公式的真实接受率
+        base_confidences = np.array([x['base_confidence'] for x in data])
+        draft_confidences = np.array([x['draft_confidence'] for x in data])
+        
+        # 确保draft_confidence不为0，避免除零错误
+        draft_confidences = np.maximum(draft_confidences, 1e-10)
+        
+        # 应用speculative decoding接受公式: min(1, p_base / p_draft)
+        acceptance_probs = np.minimum(1.0, base_confidences / draft_confidences)
+        
+        soft = acceptance_probs
         hard = np.array([x.get('base_top1_token', x.get('hard_label', 0)) for x in data]).astype(int)
+        # --- NaN过滤：移除任意相关字段为NaN的样本 ---
+        valid_mask = (~np.isnan(soft)) & (~np.isnan(base_confidences)) & (~np.isnan(draft_confidences))
+        for k, arr in list(feats.items()):
+            if np.issubdtype(arr.dtype, np.floating):
+                valid_mask &= ~np.isnan(arr)
+        # 应用过滤掩码
+        soft = soft[valid_mask]
+        hard = hard[valid_mask]
+        for k in feats:
+            feats[k] = feats[k][valid_mask]
         return feats, soft, hard
+        
     elif path.endswith('.npz'):
         d = np.load(path)
         feats = {k: d[k] for k in ['draft_confidence', 'tree_depth', 'avg_visual_attention_intensity',
                                    'draft_margin', 'token_category'] if k in d}
-        soft = d['base_confidence'] if 'base_confidence' in d else d['soft_labels']
+        
+        # 检查是否已经有预计算的接受率，否则计算
+        if 'acceptance_probability' in d:
+            soft = d['acceptance_probability']
+        elif 'base_confidence' in d and 'draft_confidence' in d:
+            # 计算基于speculative decoding公式的真实接受率
+            base_confidences = d['base_confidence']
+            draft_confidences = d['draft_confidence']
+            
+            # 确保draft_confidence不为0，避免除零错误
+            draft_confidences = np.maximum(draft_confidences, 1e-10)
+            
+            # 应用speculative decoding接受公式: min(1, p_base / p_draft)
+            acceptance_probs = np.minimum(1.0, base_confidences / draft_confidences)
+            soft = acceptance_probs
+        else:
+            # 回退到原始逻辑
+            soft = d['base_confidence'] if 'base_confidence' in d else d['soft_labels']
+            
         hard = d['base_top1_token'] if 'base_top1_token' in d else d['hard_labels']
+        # --- NaN过滤：移除任意相关字段为NaN的样本 ---
+        valid_mask = ~np.isnan(soft)
+        if 'draft_confidence' in d:
+            valid_mask &= ~np.isnan(d['draft_confidence'])
+        if 'base_confidence' in d:
+            valid_mask &= ~np.isnan(d['base_confidence'])
+        for k, arr in list(feats.items()):
+            if np.issubdtype(arr.dtype, np.floating):
+                valid_mask &= ~np.isnan(arr)
+        # 应用过滤掩码
+        soft = soft[valid_mask]
+        hard = hard[valid_mask]
+        for k in feats:
+            feats[k] = feats[k][valid_mask]
         return feats, soft, hard
     else:
         raise ValueError("Unsupported file format")
 
+
+def benchmark_calibrator_timing(
+    calibrator: BaseCalibrator,
+    features: Dict[str, np.ndarray],
+    soft_labels: np.ndarray,
+    hard_labels: np.ndarray,
+    sample_weights: Optional[np.ndarray] = None,
+    n_predict_rounds: int = 5,
+    split_batches: Optional[int] = None,
+    seed: int = 42,
+    refit: bool = True,
+):
+    """
+    评估校准器的训练与推理耗时，并打印结构化表格。
+
+    参数:
+    - calibrator: 已实例化的校准器 (如 GroupedIsotonicCalibrator)。
+    - features: 特征字典，键必须包含 'draft_confidence'、'token_category'、'avg_visual_attention_intensity'、'tree_depth' 等训练所需字段。
+    - soft_labels: 软标签 (概率)。
+    - hard_labels: 硬标签 (0/1)。
+    - sample_weights: 可选样本权重。
+    - n_predict_rounds: 重复预测轮数，用于统计均值与方差。
+    - split_batches: 若设置为正整数，则将数据按该批次数分块进行推理计时，模拟批处理。
+    - seed: 随机种子。
+    - refit: 是否在计时前对传入校准器进行重新训练 (fit)。
+
+    输出: 在标准输出打印结构化表格，包括训练耗时、预测均值/方差、吞吐量等。
+    """
+    set_seed(seed)
+
+    # 先做一次预处理以拿到 draft_conf 并构造有效掩码，避免 NaN/Inf 干扰
+    try:
+        proc = calibrator._preprocess_features(features, fit_mode=True)
+        c = np.asarray(proc['draft_conf'])
+    except Exception:
+        # 在极端情况下（预处理失败）直接尝试使用原始 features
+        c = np.asarray(features.get('draft_confidence', []))
+
+    # 构建有效样本掩码
+    mask_valid = np.isfinite(c) & (c >= 0.0) & (c <= 1.0)
+    if soft_labels is not None:
+        mask_valid &= np.isfinite(np.asarray(soft_labels))
+    if hard_labels is not None:
+        mask_valid &= np.isfinite(np.asarray(hard_labels))
+    if sample_weights is not None:
+        mask_valid &= np.isfinite(np.asarray(sample_weights))
+
+    def _apply_mask_to_features(feats: Dict[str, np.ndarray], mask: np.ndarray) -> Dict[str, np.ndarray]:
+        out = {}
+        for k, v in feats.items():
+            arr = np.asarray(v)
+            # 仅当长度匹配时才使用掩码过滤
+            if arr.ndim > 0 and arr.shape[0] == mask.shape[0]:
+                out[k] = arr[mask]
+            else:
+                out[k] = arr
+        return out
+
+    feats_valid = _apply_mask_to_features(features, mask_valid)
+    soft_valid = np.asarray(soft_labels)[mask_valid]
+    hard_valid = np.asarray(hard_labels)[mask_valid]
+    weights_valid = np.asarray(sample_weights)[mask_valid] if sample_weights is not None else None
+
+    n_total = int(len(next(iter(features.values())))) if len(features) > 0 else 0
+    n_used = int(mask_valid.sum())
+
+    # 训练计时
+    train_time = None
+    if refit:
+        t0 = time.perf_counter()
+        calibrator.fit(feats_valid, soft_valid, hard_valid, sample_weights=weights_valid)
+        train_time = time.perf_counter() - t0
+
+    # 预测计时 (重复 n_predict_rounds 次，包含一次预热)
+    # 预热
+    try:
+        _ = calibrator.predict_proba(feats_valid)
+    except Exception:
+        # 若预热失败，仍继续计时但标记异常
+        pass
+
+    pred_times = []
+    if split_batches and isinstance(split_batches, int) and split_batches > 0:
+        # 分批计时：将有效数据均匀划分为 split_batches 份
+        M = n_used
+        idx_all = np.arange(M)
+        batches = np.array_split(idx_all, split_batches)
+
+        def _slice_features(feats: Dict[str, np.ndarray], idx: np.ndarray) -> Dict[str, np.ndarray]:
+            sliced = {}
+            for k, v in feats.items():
+                arr = np.asarray(v)
+                if arr.ndim > 0 and arr.shape[0] == M:
+                    sliced[k] = arr[idx]
+                else:
+                    sliced[k] = arr
+            return sliced
+
+        for _ in range(max(n_predict_rounds, 1)):
+            t0 = time.perf_counter()
+            for b in batches:
+                f_b = _slice_features(feats_valid, b)
+                _ = calibrator.predict_proba(f_b)
+            dt = time.perf_counter() - t0
+            pred_times.append(dt)
+    else:
+        # 整体一次性预测计时
+        for _ in range(max(n_predict_rounds, 1)):
+            t0 = time.perf_counter()
+            _ = calibrator.predict_proba(feats_valid)
+            dt = time.perf_counter() - t0
+            pred_times.append(dt)
+
+    pred_mean = float(np.mean(pred_times)) if len(pred_times) > 0 else float('nan')
+    pred_std = float(np.std(pred_times)) if len(pred_times) > 0 else float('nan')
+    throughput_samples_per_s = (n_used / pred_mean) if pred_mean and pred_mean > 0 else float('nan')
+
+    # 尝试收集部分校准器配置，便于表格展示
+    cal_name = calibrator.__class__.__name__
+    cfg_items = []
+    for attr in [
+        'min_samples_per_group', 'out_of_bounds', 'target', 'use_adaptive_params', 'max_grouping_level'
+    ]:
+        if hasattr(calibrator, attr):
+            cfg_items.append(f"{attr}={getattr(calibrator, attr)}")
+    cfg_str = (", ".join(cfg_items)) if cfg_items else "(no extra params)"
+
+    # 打印结构化表格
+    def _row(label: str, value: str, w_label: int = 28, w_value: int = 24) -> str:
+        return f"| {label:<{w_label}} | {value:<{w_value}} |"
+
+    w_label = 28
+    w_value = 24
+    sep = "+" + "-" * (w_label + 2) + "+" + "-" * (w_value + 2) + "+"
+    print(sep)
+    print(_row("Calibrator", f"{cal_name}"))
+    print(sep)
+    print(_row("Config", cfg_str[:w_value]))
+    print(sep)
+    print(_row("Total samples", f"{n_total}"))
+    print(_row("Used (valid) samples", f"{n_used}"))
+    print(sep)
+    if train_time is not None:
+        print(_row("Train time (s)", f"{train_time:.6f}"))
+    else:
+        print(_row("Train time (s)", "(skipped)"))
+    print(_row("Predict rounds", f"{n_predict_rounds}"))
+    print(_row("Predict mean (s)", f"{pred_mean:.6f}"))
+    print(_row("Predict std (s)", f"{pred_std:.6f}"))
+    print(_row("Throughput (samples/s)", f"{throughput_samples_per_s:.2f}"))
+    if split_batches and isinstance(split_batches, int) and split_batches > 0:
+        print(_row("Batches", f"{split_batches}"))
+    print(sep)
 
 # =========================
 # Simple offline test
@@ -502,7 +800,7 @@ def _print_metrics(name: str, metrics: Dict[str, float]):
         if k in metrics:
             print(f"  {k}: {metrics[k]:.6f}")
 
-def calibrator_training(calibrator_dir: str, json_path: str):
+def calibrator_training(calibrator_dir: str, json_path: str, target="soft"):
     """
     训练 Grouped Isotonic 与 Monotonic Network 两种校准器并保存到指定目录。
     参数:
@@ -527,12 +825,14 @@ def calibrator_training(calibrator_dir: str, json_path: str):
     # 训练 Isotonic（硬标签）
     gi = GroupedIsotonicCalibrator(
         min_samples_per_group=200,
-        use_adaptive_params=True
+        use_adaptive_params=True,
+        max_grouping_level=2,
+        target=target
     )
     
     gi.fit(feats, soft, hard)
     metrics_gi = gi.evaluate(feats, soft, hard)
-    gi_model_path = os.path.join(calibrator_dir, "grouped_isotonic_calibrator.pkl")
+    gi_model_path = os.path.join(calibrator_dir, f"grouped_isotonic_calibrator.pkl")
     gi_metrics_path = os.path.join(calibrator_dir, "grouped_isotonic_metrics.json")
     gi.save(gi_model_path)
     with open(gi_metrics_path, "w") as f:
@@ -547,9 +847,264 @@ def calibrator_training(calibrator_dir: str, json_path: str):
     return gi, None
 
 
+def compare_ece_train_val(json_path: str, val_ratio: float = 0.2, target: str = "soft", seed: int = 42,
+                           n_bins: int = 20, equal_freq: bool = True, raw_conf_is_prob: bool = True,
+                           save_svg_dir: str = None, pre_use_acceptance_prob: bool = True):
+    """
+    将数据划分为 80% 训练 + 20% 验证，训练校准器后在验证集上对比训练前后的校准质量（ECE/Brier/NLL）。
+
+    参数:
+        json_path: 校准数据 JSON/NPZ 路径
+        val_ratio: 验证集占比（默认 0.2）
+        target: 校准器学习目标（"soft" 使用真实接受率，或 "hard" 使用硬标签）
+        seed: 随机种子保证可复现划分
+        n_bins: ECE 分箱数量（默认 20）
+        equal_freq: True 使用等频分箱，False 使用等宽分箱
+        raw_conf_is_prob: 如果为 False，表示 draft_confidence 不是概率，将通过 Sigmoid 映射到 [0,1]
+        save_svg_dir: 若提供路径，则在该目录生成 pre/post 可靠性图（SVG）
+        pre_use_acceptance_prob: 若为 True（默认），pre 预测直接使用接受概率 soft_val，确保与后验预测同一事件语义；
+                                 若为 False，则以 draft_confidence 为未校准预测（按 raw_conf_is_prob 处理）。
+
+    打印:
+        - 训练/验证样本数及正例率
+        - 验证集上 pre/post 的 ECE、Brier 分数、LogLoss（NLL）
+        - 指标改善量（post - pre，负值表示改善）
+
+    返回:
+        dict，包含 ece_pre/post、brier_pre/post、nll_pre/post、delta_ece/brier/nll、sizes
+    """
+    set_seed(seed)
+    feats, soft, hard = load_calibration_data(json_path)
+    n = len(hard)
+    assert n > 0, "数据为空"
+    assert 'draft_confidence' in feats, "features 必须包含 'draft_confidence'"
+
+    # 划分索引
+    idx = np.arange(n)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(idx)
+    split = int(n * (1.0 - val_ratio))
+    train_idx, val_idx = idx[:split], idx[split:]
+
+    # 子集构造
+    feats_train = {k: v[train_idx] for k, v in feats.items()}
+    feats_val = {k: v[val_idx] for k, v in feats.items()}
+    soft_train, soft_val = soft[train_idx], soft[val_idx]
+    hard_train, hard_val = hard[train_idx], hard[val_idx]
+
+    print("=" * 60)
+    print(f"[Calibrator] Split sizes: train={len(train_idx)} ({len(train_idx)/n:.1%}), val={len(val_idx)} ({len(val_idx)/n:.1%})")
+    print(f"[Calibrator] Train pos_rate={hard_train.mean():.4f}; Val pos_rate={hard_val.mean():.4f}")
+    print("=" * 60)
+
+    # 训练校准器
+    gi = GroupedIsotonicCalibrator(
+        min_samples_per_group=200,
+        use_adaptive_params=True,
+        max_grouping_level=2,
+        target=target
+    )
+    gi.fit(feats_train, soft_train, hard_train)
+
+    # 验证集：数值过滤（不改训练流程，只在验证上做过滤）
+    val_mask = np.isfinite(soft_val) & (soft_val >= 0.0) & (soft_val <= 1.0)
+    filter_reason = "soft in [0,1] & finite"
+    if not pre_use_acceptance_prob:
+        rc = feats_val['draft_confidence']
+        rc_is_finite = np.isfinite(rc)
+        if raw_conf_is_prob:
+            rc_in_range = (rc >= 0.0) & (rc <= 1.0)
+            val_mask &= rc_is_finite & rc_in_range
+            filter_reason += "; draft_confidence in [0,1] & finite (raw_conf_is_prob=True)"
+        else:
+            val_mask &= rc_is_finite
+            filter_reason += "; draft_confidence finite (raw_conf_is_prob=False)"
+    kept = int(np.sum(val_mask))
+    dropped = int(len(val_mask) - kept)
+    
+    if dropped > 0:
+        print(f"[Validation] Filtering invalid values on val set: kept={kept}, dropped={dropped} (rules: {filter_reason})")
+    else:
+        print(f"[Validation] No invalid values found on val set (rules: {filter_reason})")
+    
+    # 若过滤结果为空，回退到未过滤的验证集
+    if kept == 0:
+        print("[Validation] Warning: No valid samples after filtering; falling back to unfiltered val set.")
+        feats_val_filt = feats_val
+        soft_val_filt = soft_val
+        hard_val_filt = hard_val
+    else:
+        feats_val_filt = {k: v[val_mask] for k, v in feats_val.items()}
+        soft_val_filt = soft_val[val_mask]
+        hard_val_filt = hard_val[val_mask]
+
+    # 验证集：训练前（未校准）预测（在过滤后的验证集上）
+    if pre_use_acceptance_prob:
+        # 使用接受概率（同一事件语义）作为 pre baseline，确保公平比较
+        pred_pre = np.clip(soft_val_filt, 1e-4, 1 - 1e-4)
+        print("[Validation] Pre predictor: acceptance_prob (soft)")
+    else:
+        raw_pre = feats_val_filt['draft_confidence']
+        if raw_conf_is_prob:
+            pred_pre = np.clip(raw_pre, 1e-4, 1 - 1e-4)
+            print("[Validation] Pre predictor: raw draft_confidence (treated as probability)")
+        else:
+            pred_pre = 1.0 / (1.0 + np.exp(-raw_pre))  # Sigmoid 映射到概率域
+            pred_pre = np.clip(pred_pre, 1e-4, 1 - 1e-4)
+            print("[Validation] Pre predictor: sigmoid(draft_confidence)")
+
+    # 验证集：训练后（经校准器输出）预测（在过滤后的验证集上）
+    pred_post = gi.predict_proba(feats_val_filt)
+
+    # 指标计算（在过滤后的验证集上）
+    ece_pre = BaseCalibrator._compute_ece(pred_pre, hard_val_filt, sample_weights=None, n_bins=n_bins, equal_freq=equal_freq)
+    ece_post = BaseCalibrator._compute_ece(pred_post, hard_val_filt, sample_weights=None, n_bins=n_bins, equal_freq=equal_freq)
+    brier_pre = brier_score_loss(hard_val_filt, pred_pre)
+    brier_post = brier_score_loss(hard_val_filt, pred_post)
+    nll_pre = log_loss(hard_val_filt, np.vstack([1-pred_pre, pred_pre]).T, labels=[0,1])
+    nll_post = log_loss(hard_val_filt, np.vstack([1-pred_post, pred_post]).T, labels=[0,1])
+
+    delta_ece = ece_post - ece_pre
+    delta_brier = brier_post - brier_pre
+    delta_nll = nll_post - nll_pre
+
+    print(f"[Validation] ECE(pre, bins={n_bins}, equal_freq={equal_freq}) = {ece_pre:.6f}")
+    print(f"[Validation] ECE(post, bins={n_bins}, equal_freq={equal_freq}) = {ece_post:.6f}")
+    print(f"[Validation] ΔECE = {delta_ece:.6f} (负值表示改善)")
+    print(f"[Validation] Brier(pre) = {brier_pre:.6f}")
+    print(f"[Validation] Brier(post) = {brier_post:.6f}")
+    print(f"[Validation] ΔBrier = {delta_brier:.6f} (负值表示改善)")
+    print(f"[Validation] NLL(pre) = {nll_pre:.6f}")
+    print(f"[Validation] NLL(post) = {nll_post:.6f}")
+    print(f"[Validation] ΔNLL = {delta_nll:.6f} (负值表示改善)")
+
+    # 可靠性图（SVG）
+    if save_svg_dir is not None:
+        import os
+        import matplotlib.pyplot as plt
+        os.makedirs(save_svg_dir, exist_ok=True)
+
+        def _bin_stats(pred: np.ndarray, labels: np.ndarray):
+            if equal_freq:
+                quantiles = np.linspace(0, 1, n_bins + 1)
+                boundaries = np.quantile(pred, quantiles)
+                boundaries = np.unique(boundaries)
+                if len(boundaries) < n_bins + 1:
+                    boundaries = np.linspace(0, 1, n_bins + 1)
+                bin_idx = np.digitize(pred, boundaries) - 1
+                bin_idx = np.clip(bin_idx, 0, len(boundaries) - 2)
+                actual_bins = len(boundaries) - 1
+            else:
+                boundaries = np.linspace(0, 1, n_bins + 1)
+                bin_idx = np.digitize(pred, boundaries) - 1
+                bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+                actual_bins = n_bins
+            bin_conf, bin_acc = [], []
+            for i in range(actual_bins):
+                m = bin_idx == i
+                if np.sum(m) > 0:
+                    bin_conf.append(float(np.mean(pred[m])))
+                    bin_acc.append(float(np.mean(labels[m])))
+            return np.array(bin_conf), np.array(bin_acc)
+
+        def _plot_reliability(bin_conf: np.ndarray, bin_acc: np.ndarray, title: str, save_name: str):
+            plt.figure(figsize=(8, 6))
+            plt.plot([0, 1], [0, 1], 'k--', linewidth=2, alpha=0.8, label='Perfect Calibration')
+            plt.plot(bin_conf, bin_acc, 'o-', color='steelblue', linewidth=2, markersize=6, label='Binned')
+            plt.xlabel('Confidence', fontsize=12)
+            plt.ylabel('Empirical Acceptance Rate', fontsize=12)
+            plt.title(title, fontsize=14)
+            plt.grid(True, alpha=0.3)
+            plt.xlim(0, 1)
+            plt.ylim(0, 1)
+            plt.legend(loc='upper left')
+            save_path = os.path.join(save_svg_dir, save_name)
+            plt.savefig(save_path, format='svg', bbox_inches='tight')
+            plt.close()
+            print(f"[Validation] Reliability diagram saved: {save_path}")
+
+        conf_pre, acc_pre = _bin_stats(pred_pre, hard_val)
+        conf_post, acc_post = _bin_stats(pred_post, hard_val)
+        _plot_reliability(conf_pre, acc_pre, f'Reliability (pre, bins={n_bins}, equal_freq={equal_freq})', 'reliability_pre.svg')
+        _plot_reliability(conf_post, acc_post, f'Reliability (post, bins={n_bins}, equal_freq={equal_freq})', 'reliability_post.svg')
+
+    return {
+        'train_size': int(len(train_idx)),
+        'val_size': int(len(val_idx)),
+        'ece_pre': float(ece_pre),
+        'ece_post': float(ece_post),
+        'delta_ece': float(delta_ece),
+        'brier_pre': float(brier_pre),
+        'brier_post': float(brier_post),
+        'delta_brier': float(delta_brier),
+        'nll_pre': float(nll_pre),
+        'nll_post': float(nll_post),
+        'delta_nll': float(delta_nll)
+    }
+
 if __name__ == "__main__":
     # test_calibrator_training()
     # compare_before_after_calibration()
-    calibrator_path = "/root/Speculative_decoding/calibration_data/test_calibrators"
-    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_600_val_0_test_900_total_1500_temperature_0/training_calibration_data.json"
-    calibrator_training(calibrator_path, json_path)
+    calibrator_path = "/root/Speculative_decoding/calibration_data_13b/test_calibrators"
+    json_path = "/root/Speculative_decoding/calibration_data/chartqa_calib_isotonic_train_600_val_0_test_400_total_1000_temperature_0/training_calibration_data.json"
+    compare_ece_train_val(json_path)
+    # calibrator_training(calibrator_path, json_path, "soft")
+
+    # ======= Benchmark: 训练与推理耗时 =======
+    try:
+        res = load_calibration_data(json_path)
+        if isinstance(res, tuple):
+            if len(res) == 4:
+                features, soft_labels, hard_labels, sample_weights = res
+            elif len(res) == 3:
+                features, soft_labels, hard_labels = res
+                sample_weights = None
+            else:
+                raise ValueError(f"Unexpected return length {len(res)} from load_calibration_data")
+        else:
+            raise ValueError("load_calibration_data did not return a tuple")
+    except Exception as e:
+        print(f"[main] 加载校准数据失败：{e}")
+        features, soft_labels, hard_labels, sample_weights = {}, np.array([]), np.array([]), None
+
+    # 尝试补全缺失的关键特征键，避免计时过程因 KeyError 中断
+    required_keys = ['draft_confidence', 'token_category', 'avg_visual_attention_intensity', 'tree_depth']
+    if isinstance(features, dict):
+        # 推断样本数 n
+        if 'draft_confidence' in features:
+            n = int(len(np.asarray(features['draft_confidence'])))
+        else:
+            n = 0
+            for v in features.values():
+                try:
+                    n = int(len(np.asarray(v)))
+                    if n > 0:
+                        break
+                except Exception:
+                    continue
+        for k in required_keys:
+            if k not in features:
+                if k == 'token_category':
+                    features[k] = np.array(['content'] * n)
+                elif k == 'avg_visual_attention_intensity':
+                    features[k] = np.zeros(n, dtype=float)
+                elif k == 'tree_depth':
+                    features[k] = np.zeros(n, dtype=int)
+                elif k == 'draft_confidence':
+                    features[k] = np.clip(np.zeros(n, dtype=float), 0.0, 1.0)
+
+    calib = GroupedIsotonicCalibrator(min_samples_per_group=200, target='hard')
+    try:
+        benchmark_calibrator_timing(
+            calibrator=calib,
+            features=features,
+            soft_labels=soft_labels,
+            hard_labels=hard_labels,
+            sample_weights=sample_weights,
+            n_predict_rounds=5,
+            split_batches=4,
+            seed=42,
+            refit=True,
+        )
+    except Exception as e:
+        print(f"[main] 计时基准运行失败：{e}")

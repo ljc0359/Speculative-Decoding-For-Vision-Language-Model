@@ -4,6 +4,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 import copy
 import os
+import time  # 添加time模块导入
 from tqdm import tqdm
 from datetime import timedelta
 import json
@@ -303,19 +304,24 @@ class Llava_MSD_Calibrated(lmms):
         return new_list
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
+        # 记录开始时间
+        start_time = time.time()
+        
         res = []
         
-        # print(requests)
-        calibrator_mode = "isotonic" ## isotonic, monotonic
-        # 数据分割配置
+        calibrator_mode = "isotonic"
         total_samples = len(requests)
-        train_ratio = 0  # 40% 用于训练
-        val_ratio = 0    # 10% 用于验证
-        test_ratio = 1   # 50% 用于测试
-        
+        task_name = requests[0].task_name if requests else "unknown"
+        train_ratio = requests[0].arguments[1].get("train_ratio", 0.2)
+        val_ratio = 0
+        test_ratio = 1 - train_ratio
+        use_calibration=True
+        use_opt_tree=True
+
+        print(f"train_ratio={train_ratio}, val_ratio={val_ratio}, test_ratio={test_ratio}")
         train_end = int(total_samples * train_ratio)
         val_end = int(total_samples * (train_ratio + val_ratio))
-
+    
         # 动态创建结果保存路径
         # 从requests中获取任务名称
         task_name = requests[0].task_name if requests else "unknown"
@@ -328,24 +334,40 @@ class Llava_MSD_Calibrated(lmms):
                 temperature = 0
         except Exception:
             temperature = 0
-
+    
+        # 新增：如果 Task 有 CLI args，则读取 train_ratio 控制集划分
+        try:
+            if hasattr(self, "task_dict") and task_name in self.task_dict:
+                cli_args = getattr(self.task_dict[task_name], "args", None)
+                if cli_args is not None and hasattr(cli_args, "train_ratio") and cli_args.train_ratio is not None:
+                    tr = float(cli_args.train_ratio)
+                    if tr < 0.0 or tr > 1.0:
+                        print(f"[Warning] train_ratio={tr} out of bounds, clipping to [0,1]")
+                    train_ratio = max(0.0, min(1.0, tr))
+        except Exception as _e:
+            # 读取失败则继续用默认值
+            pass
+    
+        # 根据最终的 train_ratio 计算划分
+        test_ratio = max(0.0, 1.0 - train_ratio - val_ratio)
+        train_end = int(total_samples * train_ratio)
+        val_end = int(total_samples * (train_ratio + val_ratio))
+    
         train_count = train_end
         val_count = val_end - train_end
         test_count = total_samples - val_end
         
         # 构建动态路径（新增校准器策略标识）
-        result_folder_name = f"{task_name}_calib_{calibrator_mode}_train_{train_count}_val_{val_count}_test_{test_count}_total_{total_samples}_temperature_{temperature}"
-        base_calibration_path = f"/root/Speculative_decoding/calibration_data/{result_folder_name}"
+        result_folder_name = f"{task_name}_calib_{calibrator_mode}_train_{train_count}_val_{val_count}_test_{test_count}_total_{total_samples}_temperature_{temperature}_calibration_{use_calibration}"
+        base_calibration_path = f"/root/Speculative_decoding/calibration_data_13b/{result_folder_name}"
         cross_attention_path = base_calibration_path
     
         calibration_logger = get_calibration_logger(base_calibration_path)
-
+    
         # 确保目录存在
         os.makedirs(base_calibration_path, exist_ok=True)
         os.makedirs(cross_attention_path, exist_ok=True)
-        
-        print(f"Results will be saved to: {base_calibration_path}")
-
+    
         # 跳过训练样本的标志（当已存在校准器时启用）
         skip_to_test = False
 
@@ -356,8 +378,8 @@ class Llava_MSD_Calibrated(lmms):
         calibrator_trained = False
         trained_calibrators = {}
         
-        print(f"Isotonic path: {isotonic_path}")
-        print(os.path.exists(isotonic_path))
+        # print(f"Isotonic path: {isotonic_path}")
+        # print(os.path.exists(isotonic_path))
         
         if os.path.exists(isotonic_path):
             print("\n" + "="*50)
@@ -560,7 +582,7 @@ class Llava_MSD_Calibrated(lmms):
                     setattr(self.model, "acclen", 0)
                     setattr(self.model, "accnum", 0)
                     
-                    print(f"actual temperature {gen_kwargs['temperature']}")
+                    # print(f"actual temperature {gen_kwargs['temperature']}")
                     # 传递inputs_embeds给msdgenerate，这样可以正确计算图像token位置
 
                     output_ids = self.model.msdgenerate(
@@ -575,17 +597,17 @@ class Llava_MSD_Calibrated(lmms):
                         attention_masks_for_padding=attention_masks,
                         train_calibrator=train_calibrator_flag,
                         use_calibrator=use_calibrator,
-                        calibrator=trained_calibrators.get(calibrator_mode, None) if use_calibrator else None
+                        calibrator=trained_calibrators.get(calibrator_mode, None) if use_calibrator and use_calibration else None
                         # calibrator=None
                     ) 
 
                     
-                    print(f"actual temperature {gen_kwargs['temperature']}")
+                    # print(f"actual temperature {gen_kwargs['temperature']}")
                     # accumulate overall stats
                     self.total_accept_len += int(getattr(self.model, "acclen", 0))
                     self.total_accept_steps += int(getattr(self.model, "accnum", 0))
 
-                    print(f"Average Acceptance Rate: {self.total_accept_len/self.total_accept_steps}")
+                    # print(f"Average Acceptance Rate: {self.total_accept_len/self.total_accept_steps}")
                 else:
                     output_ids = self.model.naivegenerate(input_ids, inputs_embeds=inputs_embeds, temperature=gen_kwargs["temperature"], max_new_tokens=512)
                 cont = output_ids[:,input_ids.shape[1]:]
@@ -617,27 +639,26 @@ class Llava_MSD_Calibrated(lmms):
             
             stats = calibration_logger.get_calibration_stats(
                 num_bins=20, 
-                save_figure=True, 
                 figure_path=figure_save_path
             )
             
             if stats:
                 eval_logger.info(f"Test phase calibration analysis completed:")
-                eval_logger.info(f"  - ECE: {stats.get('ece', 'N/A'):.4f}")
                 eval_logger.info(f"  - Overall acceptance rate: {stats.get('overall_acceptance_rate', 'N/A'):.4f}")
                 eval_logger.info(f"  - Total samples: {stats.get('total_samples', 'N/A')}")
-                eval_logger.info(f"  - Figure saved to: {figure_save_path}")
     
-                # 将总体接受率与样本数写入 base_calibration_path 下的 "acceptance rate" 文件
                 try:
+                    # 计算总用时
+                    end_time = time.time()
+                    total_duration_seconds = end_time - start_time
+                    
                     acceptance_file = os.path.join(base_calibration_path, "acceptance rate")
                     acceptance_payload = {
                         "average_acceptance_rate": float(stats.get("overall_acceptance_rate", 0.0)),
                         "total_samples": int(stats.get("total_samples", 0)),
                         "self.total_accept_len": self.total_accept_len,
                         "self.total_accept_steps": self.total_accept_steps,
-                        "average_acc_per_step": self.total_accept_len / self.total_accept_steps,
-                        "ece":  float(stats.get("ece", 0.0))
+                        "total_duration_seconds": float(total_duration_seconds)
                     }
 
                     with open(acceptance_file, "w", encoding="utf-8") as f:
@@ -646,10 +667,10 @@ class Llava_MSD_Calibrated(lmms):
                 except Exception as write_err:
                     eval_logger.warning(f"Failed to write acceptance rate summary: {write_err}")
             
-            calibration_logger.plot_cross_modal_attention_comprehensive_analysis(
-                save_path=cross_attention_path, 
-                confidence_binning="both"
-            )
+            # calibration_logger.plot_cross_modal_attention_comprehensive_analysis(
+            #     save_path=cross_attention_path, 
+            #     confidence_binning="both"
+            # )
             
         return res
     

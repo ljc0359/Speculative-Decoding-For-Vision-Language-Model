@@ -13,4 +13,4 @@ python -m lmms_eval \
   --use_msd \
   --log_samples \
   --output_path /root/Speculative_decoding/Speculative-Decoding-For-Vision-Language-Model/lmms-eval/results/mathverse_testmini_vision_intensive.json \
-  --limit 1000
+  --bottom 631
