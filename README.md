@@ -72,3 +72,18 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes=1 --main_process_port=2
 - `<base_model_path>`: path to the base pretrained model
 - `<msd_model_path>`: path to the MSD model
 ---
+
+**Example:**
+
+```bash
+python -m lmms_eval \
+  --model llava_msd_calibrated \
+  --model_args pretrained="/root/Speculative_decoding/checkpoint/llava-v1.5-7b" \
+  --msd_model_path /root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-7B \
+  --tasks chartqa \
+  --batch_size 1 \
+  --gen_kwargs temperature=0,train_ratio=0.2 \
+  --use_msd \
+  --use_calibration \
+  --log_samples \
+```
