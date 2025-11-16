@@ -1,5 +1,5 @@
 # ==== Inject HuggingFace token (DO NOT COMMIT SECRETS) ====
-export HUGGINGFACE_HUB_TOKEN="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"
+export HUGGINGFACE_HUB_TOKEN="YOUR_TOKEN"
 export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
 
 python -m lmms_eval \

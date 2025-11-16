@@ -1,5 +1,5 @@
 # ==== Inject HuggingFace token (DO NOT COMMIT SECRETS) ====
-export HUGGINGFACE_HUB_TOKEN="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"
+export HUGGINGFACE_HUB_TOKEN="YOUR_TOKEN"
 export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
 
 
@@ -47,7 +47,7 @@ python -m lmms_eval \
   --msd_model_path /root/Speculative_decoding/checkpoint/MSD-LLaVA1.5-7B \
   --tasks chartqa \
   --batch_size 1 \
-  --gen_kwargs temperature=0,train_ratio=0 \
+  --gen_kwargs temperature=0,train_ratio=0.2 \
   --use_msd \
   --use_calibration \
   --log_samples \
